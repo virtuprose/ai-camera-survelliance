@@ -2,6 +2,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const dashboardRoot = resolve(projectRoot, "apps/dashboard");
 const edgeRoot = resolve(projectRoot, "services/edge");
 const started: Bun.Subprocess[] = [];
 
@@ -55,6 +56,31 @@ async function stopStarted() {
   }
 }
 
+async function normalizeGeneratedTypes() {
+  const typegen = Bun.spawn(["bun", "x", "next", "typegen"], {
+    cwd: dashboardRoot,
+    env: process.env,
+    stdin: "ignore",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const code = await typegen.exited;
+  if (code !== 0) {
+    throw new Error(`Next.js type generation failed with exit code ${code}.`);
+  }
+}
+
+async function cleanup() {
+  await stopStarted();
+  try {
+    await normalizeGeneratedTypes();
+    return true;
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return false;
+  }
+}
+
 async function main() {
   if (!(await reachable("http://127.0.0.1:8787/health"))) {
     start(
@@ -81,22 +107,22 @@ async function main() {
     stderr: "inherit",
   });
   const code = await tests.exited;
-  await stopStarted();
-  process.exit(code);
+  const normalized = await cleanup();
+  process.exit(code === 0 && !normalized ? 1 : code);
 }
 
 process.once("SIGINT", async () => {
-  await stopStarted();
+  await cleanup();
   process.exit(130);
 });
 
 process.once("SIGTERM", async () => {
-  await stopStarted();
+  await cleanup();
   process.exit(143);
 });
 
 main().catch(async (error) => {
   console.error(error instanceof Error ? error.message : String(error));
-  await stopStarted();
+  await cleanup();
   process.exit(1);
 });
