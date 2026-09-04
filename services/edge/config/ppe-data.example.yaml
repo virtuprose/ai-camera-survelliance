@@ -1,0 +1,9 @@
+path: /absolute/path/to/consented-ppe-dataset
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: mask
+  1: gloves
+  2: hairnet
+  3: apron

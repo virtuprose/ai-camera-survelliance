@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+*.command text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.mp4 binary
+*.pdf binary
+*.pptx binary
+*.zip binary

@@ -1,0 +1,29 @@
+{
+  "name": "orvia-ai-surveillance",
+  "description": "Local-first AI video analytics demonstration for food-safety operations.",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/virtuprose/ai-camera-survelliance.git"
+  },
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "local": "bun run scripts/local-demo.ts",
+    "dev": "bun run --cwd apps/dashboard dev",
+    "edge": "cd services/edge && DATA_DIR=data/client-demo uv run uvicorn foodsafe_edge.main:app --host 127.0.0.1 --port 8787",
+    "edge:prior-data": "cd services/edge && DATA_DIR=data/live uv run uvicorn foodsafe_edge.main:app --host 127.0.0.1 --port 8787",
+    "edge:fallback": "cd services/edge && DATA_DIR=data/client-fallback CAMERA_KIND=file CAMERA_SOURCE=assets/fallback-demo.mp4 CAMERA_LABEL='Prerecorded local fallback' DETECTOR_BACKEND=hog uv run uvicorn foodsafe_edge.main:app --host 127.0.0.1 --port 8787",
+    "edge:test": "cd services/edge && uv run pytest",
+    "markers": "cd services/edge && uv run python scripts/generate_markers.py",
+    "camera:soak": "cd services/edge && uv run python scripts/pipeline_soak.py --minutes 10",
+    "camera:raw-soak": "cd services/edge && uv run python scripts/camera_soak.py --minutes 10",
+    "ppe:acceptance": "cd services/edge && uv run python scripts/ppe_acceptance.py",
+    "demo:rehearse": "cd services/edge && uv run python scripts/rehearse_demo.py --minutes 8",
+    "build": "bun run --cwd apps/dashboard build",
+    "lint": "bun run --cwd apps/dashboard lint",
+    "typecheck": "bun run --cwd apps/dashboard typecheck",
+    "test": "bun run --cwd apps/dashboard test",
+    "test:e2e": "bun run scripts/run-e2e.ts",
+    "repo:audit": "bash scripts/check-public-release.sh"
+  }
+}

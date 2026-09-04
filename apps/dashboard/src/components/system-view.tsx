@@ -1,0 +1,33 @@
+"use client";
+
+import { BellRing, Camera, Cloud, Cpu, Database, Radio, RefreshCw, ShieldCheck, Thermometer, WifiOff } from "lucide-react";
+import { useAlertSound } from "@/components/alert-sound-provider";
+import { PageHeader } from "@/components/page-header";
+import { StatusBadge } from "@/components/status-badge";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useEdgeState } from "@/hooks/use-edge";
+import { formatDateTime, formatRelative } from "@/lib/format";
+
+export function SystemView() {
+  const { state, connected, error, refresh } = useEdgeState();
+  const sound = useAlertSound();
+  const services = [
+    { label: "Video input", value: "Camera 01", state: state.health.camera, icon: Camera, detail: `${state.health.processedFps.toFixed(1)} processed frames/sec · 1280×720`, recovery: "Check camera permission, connection, or network address." },
+    { label: "Vision processing", value: "On-device processing service", state: state.health.edge, icon: Cpu, detail: "Person, zone, badge, and object analysis", recovery: "Restart vision processing and verify the model package." },
+    { label: "Live monitoring feed", value: connected ? "Annotated video available" : "Unavailable", state: state.health.stream, icon: Radio, detail: "Silent operational video", recovery: "Reconnect the preview or check the video service." },
+    { label: "Evidence & event storage", value: "Local secure event store", state: state.health.storage, icon: Database, detail: state.health.storage === "online" ? "Write self-test passed · 365-day retention date applied to every record" : state.health.storageError ?? "Storage self-test failed", recovery: "Confirm the protected data and evidence locations are writable." },
+    { label: "Data synchronization", value: "Enterprise integration channel", state: state.health.cloud, icon: Cloud, detail: `${state.health.queueDepth} records awaiting synchronization`, recovery: "Local operation continues; verify the integration connection." },
+    { label: "Remote video delivery", value: state.health.livekit === "online" ? "Connected" : "Not configured", state: state.health.livekit, icon: Radio, detail: "Encrypted silent video transport", recovery: "Confirm remote video delivery settings and device credentials." },
+    { label: "Temperature monitoring", value: state.temperature.sourceMode === "simulated" ? "Demonstration sensor" : "Connected sensor", state: state.health.sensor, icon: Thermometer, detail: state.temperature.sourceMode === "simulated" ? "SIMULATED · hardware sensor not connected" : "Continuous temperature readings", recovery: "Select and validate a real sensor before production acceptance." },
+  ] as const;
+
+  return <div className="page-shell system-page">
+    <PageHeader eyebrow="Device diagnostics" title="System status" description="Check source readiness, data freshness, privacy boundaries, and clear recovery guidance before a demonstration." actions={<Button variant="outline" onClick={() => void refresh()}><RefreshCw />Refresh checks</Button>} />
+    {!connected && <div className="connection-alert" role="alert"><WifiOff /><span><strong>Edge agent cannot be reached.</strong>{error ?? "Check the local service and camera connection."}</span><Button variant="outline" size="sm" onClick={() => void refresh()}>Retry</Button></div>}
+    <section className="system-overview panel" aria-label="System readiness summary"><div><span className={`readiness-mark ${connected ? "is-ready" : "is-offline"}`}>{connected ? <ShieldCheck /> : <WifiOff />}</span><div><span className="eyebrow">Overall readiness</span><h2>{connected ? "Monitoring services operational" : "Monitoring services need attention"}</h2><p>{connected ? "Video processing and local event storage are responding." : "The interface is showing fallback values until local services return."}</p></div></div><dl><div><dt>Last frame</dt><dd>{formatRelative(state.health.lastFrameAt)}</dd></div><div><dt>Queued sync</dt><dd>{state.health.queueDepth} records</dd></div><div><dt>Alert sound</dt><dd>{sound.enabled ? sound.armed ? "On and ready" : "On · needs interaction" : "Off"}</dd></div></dl></section>
+    <section className="health-matrix panel"><div className="section-heading"><div><span className="eyebrow">Service health</span><h2>Operational components</h2></div><StatusBadge tone={connected ? "safe" : "critical"} label={connected ? "Local path ready" : "Attention required"} /></div><Separator /><Table><TableHeader><TableRow><TableHead>Component</TableHead><TableHead>Current state</TableHead><TableHead>Detail</TableHead><TableHead>Status</TableHead><TableHead>Recovery guidance</TableHead></TableRow></TableHeader><TableBody>{services.map(({ label, value, state: serviceState, icon: Icon, detail, recovery }) => <TableRow key={label}><TableCell><span className="service-name"><i><Icon /></i><strong>{label}</strong></span></TableCell><TableCell>{value}</TableCell><TableCell><span className="service-detail">{detail}</span></TableCell><TableCell><StatusBadge tone={serviceState === "online" ? "safe" : serviceState === "offline" ? "critical" : "warning"} label={serviceState} /></TableCell><TableCell><span className="recovery-copy">{serviceState === "online" ? "No action required." : recovery}</span></TableCell></TableRow>)}</TableBody></Table></section>
+    <section className="diagnostic-grid"><article className="diagnostic-panel panel"><div className="section-heading"><div><span className="eyebrow">Diagnostic snapshot</span><h2>Current configuration</h2></div><StatusBadge tone="simulated" label="Sensor simulated" /></div><Separator /><dl className="config-list"><div><dt>Camera interface</dt><dd>Configured</dd></div><div><dt>Vision model</dt><dd>Loaded</dd></div><div><dt>Last frame</dt><dd>{formatRelative(state.health.lastFrameAt)}</dd></div><div><dt>Last state update</dt><dd>{formatDateTime(state.health.updatedAt)}</dd></div><div><dt>Queued sync records</dt><dd>{state.health.queueDepth}</dd></div><div><dt>Privacy mode</dt><dd>No facial recognition</dd></div></dl></article><article className="privacy-panel panel"><span className="privacy-icon"><BellRing /></span><span className="eyebrow">Audio & privacy</span><h2>Camera audio recording disabled</h2><p>The optional violation chime is generated inside this browser. It is never attached to camera footage or stored as evidence.</p><StatusBadge tone={sound.enabled ? "info" : "neutral"} label={sound.enabled ? "Browser chime enabled" : "Browser chime muted"} /></article></section>
+  </div>;
+}

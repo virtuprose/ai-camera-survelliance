@@ -1,0 +1,54 @@
+# JavaScript
+node_modules/
+.next/
+out/
+coverage/
+playwright-report/
+test-results/
+tmp/
+*.tsbuildinfo
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Runtime data
+data/events.db
+data/evidence/
+data/queue/
+*.db
+*.sqlite
+*.sqlite3
+models/*.pt
+models/*.onnx
+services/edge/data/
+services/edge/*.pt
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Private and generated presentation material
+.deck_build/
+deliverables/
+docs/CLIENT_*.md
+PROGRESS.md
+
+# Optional local employee reference media is never public source
+apps/dashboard/public/employees/
+
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/

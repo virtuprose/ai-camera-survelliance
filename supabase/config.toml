@@ -1,0 +1,10 @@
+project_id = "foodsafe-pilot"
+
+# Edge devices authenticate inside each function with a dedicated hashed device
+# token. Supabase user JWT verification is intentionally disabled for these two
+# device-only ingestion endpoints.
+[functions.ingest-event]
+verify_jwt = false
+
+[functions.upload-evidence]
+verify_jwt = false
