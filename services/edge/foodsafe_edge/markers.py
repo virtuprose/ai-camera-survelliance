@@ -38,14 +38,20 @@ class ArucoMarkerReader:
 EMPLOYEE_MARKERS = {
     101: {
         "employeeId": "EMP-001",
-        "displayName": "Demo Operator A",
+        "displayName": "Ahmed Hassan",
         "badgeMarkerId": 101,
         "photoUrl": None,
     },
     102: {
         "employeeId": "EMP-002",
-        "displayName": "Demo Operator B",
+        "displayName": "Muhammad Zaid",
         "badgeMarkerId": 102,
+        "photoUrl": None,
+    },
+    103: {
+        "employeeId": "EMP-003",
+        "displayName": "Fatima Ali",
+        "badgeMarkerId": 103,
         "photoUrl": None,
     },
 }

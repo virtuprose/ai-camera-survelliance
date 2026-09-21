@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from foodsafe_edge.detector import Keypoint, PersonDetection
-from foodsafe_edge.markers import Marker
+from foodsafe_edge.markers import EMPLOYEE_MARKERS, Marker
 from foodsafe_edge.pipeline import EdgePipeline
 from foodsafe_edge.ppe import ColourShapeEvidence, LandmarkColourPPEDetector, PPEStabilizer
 from foodsafe_edge.settings import Settings
@@ -300,6 +300,97 @@ def test_rolling_window_requires_twelve_consistent_frames_and_rejects_one_frame_
     assert result.items["right_glove"].state == "not_visible"
 
 
+def test_retained_violation_waits_for_a_frame_matching_stable_missing_state(tmp_path) -> None:
+    settings = Settings(
+        camera_enabled=False,
+        data_dir=tmp_path,
+        ppe_persistence_seconds=1,
+        identity_persistence_seconds=99,
+    )
+    pipeline = EdgePipeline(settings)
+    pipeline.required_ppe_items = ("mask",)
+    person = _person()
+    bare = _frame()
+    compliant = _compliant_frame(pipeline.ppe_detector, person)
+
+    stable_missing = None
+    for index in range(12):
+        stable_missing = pipeline.ppe_stabilizer.update(
+            person.track_id,
+            pipeline.ppe_detector.detect(bare, person),
+            now=float(index),
+        )
+    assert stable_missing is not None
+    assert stable_missing.items["mask"].state == "missing"
+    assert stable_missing.items["mask"].observation_state == "missing"
+
+    contrary_frame = pipeline.ppe_stabilizer.update(
+        person.track_id,
+        pipeline.ppe_detector.detect(compliant, person),
+        now=12.0,
+    )
+    assert contrary_frame.items["mask"].state == "missing"
+    assert contrary_frame.items["mask"].observation_state == "detected"
+    pipeline.ppe_missing_since[("track:17", "mask")] = time.monotonic() - 2
+    pipeline._check_ppe(None, person, "Preparation", contrary_frame, compliant)
+    assert not [
+        event for event in pipeline.store.list_events() if event["type"] == "ppe_violation"
+    ]
+
+    agreeing_frame = pipeline.ppe_stabilizer.update(
+        person.track_id,
+        pipeline.ppe_detector.detect(bare, person),
+        now=13.0,
+    )
+    assert agreeing_frame.items["mask"].observation_state == "missing"
+    pipeline._check_ppe(None, person, "Preparation", agreeing_frame, bare)
+    violation = next(
+        event for event in pipeline.store.list_events() if event["type"] == "ppe_violation"
+    )
+    assert violation["metadata"]["state"] == "missing"
+    assert violation["metadata"]["observation_state"] == "missing"
+    assert violation["metadata"]["decision_reason"].startswith("No qualifying")
+
+    stable_detected = agreeing_frame
+    for index in range(12):
+        stable_detected = pipeline.ppe_stabilizer.update(
+            person.track_id,
+            pipeline.ppe_detector.detect(compliant, person),
+            now=14.0 + index,
+        )
+    assert stable_detected.items["mask"].state == "detected"
+
+    contrary_recovery = pipeline.ppe_stabilizer.update(
+        person.track_id,
+        pipeline.ppe_detector.detect(bare, person),
+        now=26.0,
+    )
+    assert contrary_recovery.items["mask"].state == "detected"
+    assert contrary_recovery.items["mask"].observation_state == "missing"
+    pipeline.ppe_recovery_since[("track:17", "mask")] = time.monotonic() - 6
+    pipeline._check_ppe(None, person, "Preparation", contrary_recovery, bare)
+    assert not [
+        event
+        for event in pipeline.store.list_events()
+        if event["type"] == "ppe_compliance_restored"
+    ]
+
+    agreeing_recovery = pipeline.ppe_stabilizer.update(
+        person.track_id,
+        pipeline.ppe_detector.detect(compliant, person),
+        now=27.0,
+    )
+    pipeline._check_ppe(None, person, "Preparation", agreeing_recovery, compliant)
+    recovery = next(
+        event
+        for event in pipeline.store.list_events()
+        if event["type"] == "ppe_compliance_restored"
+    )
+    assert recovery["metadata"]["state"] == "detected"
+    assert recovery["metadata"]["observation_state"] == "detected"
+    assert recovery["metadata"]["decision_reason"].startswith("Central connected")
+
+
 class _OnePersonDetector:
     label = "Test pose detector"
 
@@ -312,6 +403,33 @@ class _OnePersonDetector:
 
     def reset(self) -> None:
         self.reset_called = True
+
+
+class _SwitchablePersonDetector(_OnePersonDetector):
+    def __init__(self, person: PersonDetection | None = None) -> None:
+        super().__init__(person)
+        self.visible = True
+
+    def detect(self, _frame: np.ndarray) -> list[PersonDetection]:
+        return [self.person] if self.visible else []
+
+
+class _TwoOverlappingPeopleDetector:
+    label = "Test two-person detector"
+
+    def __init__(self) -> None:
+        first = _person()
+        second = _person()
+        second.xyxy = (70, 10, 230, 390)
+        second.track_id = 18
+        self.people = [first, second]
+
+    def detect(self, _frame: np.ndarray) -> list[PersonDetection]:
+        return self.people
+
+    @staticmethod
+    def reset() -> None:
+        return None
 
 
 class _NoMarkers:
@@ -355,25 +473,156 @@ def test_automatic_monitoring_reports_runtime_readiness(tmp_path) -> None:
     assert "below 6 FPS" in health["monitoringMessage"]
 
 
-def test_badge_identity_remains_bound_to_track_during_short_occlusion(tmp_path) -> None:
+def test_badge_identity_remains_bound_for_complete_visible_track_session(tmp_path) -> None:
     pipeline = EdgePipeline(
-        Settings(camera_enabled=False, data_dir=tmp_path, identity_binding_seconds=5)
+        Settings(
+            camera_enabled=False,
+            data_dir=tmp_path,
+            identity_binding_seconds=5,
+            ppe_persistence_seconds=0,
+        )
     )
     pipeline.detector = _OnePersonDetector()
     pipeline.marker_reader = _OneBadgeThenNone()
 
     pipeline._process(_frame())
-    assert pipeline.state()["activeEmployee"]["displayName"] == "Demo Operator A"
-    assert pipeline.state()["activeEmployee"]["badgeConfidence"] == 0.98
+    employee = pipeline.state()["activeEmployee"]
+    assert employee["displayName"] == "Ahmed Hassan"
+    assert employee["badgeConfidence"] == 0.98
+    assert employee["identityAssociation"] == "badge_visible"
+    verified_at = employee["identityVerifiedAt"]
 
+    # Badge age no longer expires an identity while the same track is visible.
+    pipeline.track_employee_binding_seen[17] = time.monotonic() - 300
+    for _ in range(14):
+        pipeline._process(_frame())
+    employee = pipeline.state()["activeEmployee"]
+    assert employee["displayName"] == "Ahmed Hassan"
+    assert employee["identityMethod"] == "aruco_badge"
+    assert employee["identityAssociation"] == "track_session"
+    assert employee["identityVerifiedAt"] == verified_at
+    assert pipeline.state()["detection"]["identityStatus"]["detail"].startswith(
+        "Badge was verified earlier"
+    )
+    ppe_events = [
+        event for event in pipeline.store.list_events() if event["type"] == "ppe_violation"
+    ]
+    assert ppe_events
+    assert all(event["employeeId"] == "EMP-001" for event in ppe_events)
+    assert all(event["trackId"] == 17 for event in ppe_events)
+
+
+def test_badge_identity_survives_brief_track_loss_but_expires_after_grace(tmp_path) -> None:
+    pipeline = EdgePipeline(
+        Settings(camera_enabled=False, data_dir=tmp_path, identity_binding_seconds=5)
+    )
+    detector = _SwitchablePersonDetector()
+    pipeline.detector = detector
+    pipeline.marker_reader = _OneBadgeThenNone()
+
+    pipeline._process(_frame())
+    detector.visible = False
+    pipeline._process(_frame())
+
+    # The same tracker ID may be reacquired within the configured absence grace.
+    pipeline.track_last_seen[17] = time.monotonic() - 4
+    detector.visible = True
     pipeline._process(_frame())
     employee = pipeline.state()["activeEmployee"]
-    assert employee["displayName"] == "Demo Operator A"
-    assert employee["identityMethod"] == "aruco_badge"
+    assert employee["displayName"] == "Ahmed Hassan"
+    assert employee["identityAssociation"] == "track_session"
 
-    pipeline.track_employee_binding_seen[17] = time.monotonic() - 6
+    # A later return outside the grace is intentionally unresolved; the system
+    # does not use body appearance or facial recognition to guess identity.
+    detector.visible = False
     pipeline._process(_frame())
-    assert pipeline.state()["activeEmployee"]["displayName"] == "Unidentified staff member"
+    pipeline.track_last_seen[17] = time.monotonic() - 6
+    detector.visible = True
+    pipeline._process(_frame())
+    employee = pipeline.state()["activeEmployee"]
+    assert employee["displayName"] == "Unidentified staff member"
+    assert employee["identityAssociation"] == "not_associated"
+    assert 17 not in pipeline.track_employee_binding
+
+
+def test_detection_reset_clears_track_identity_session(tmp_path) -> None:
+    pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
+    pipeline.detector = _OnePersonDetector()
+    pipeline.marker_reader = _OneBadgeThenNone()
+
+    pipeline._process(_frame())
+    assert pipeline.track_employee_binding[17]["employeeId"] == "EMP-001"
+
+    pipeline.reset_detection()
+
+    assert pipeline.track_employee_binding == {}
+    assert pipeline.track_employee_binding_seen == {}
+    assert pipeline.track_employee_binding_verified_at == {}
+    assert pipeline.track_employee_binding_confidence == {}
+
+
+def test_one_badge_cannot_identify_two_overlapping_person_tracks(tmp_path) -> None:
+    pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
+    pipeline.detector = _TwoOverlappingPeopleDetector()
+    pipeline.marker_reader = _OneBadgeThenNone()
+
+    pipeline._process(_frame())
+
+    assert pipeline.track_employee_binding[17]["employeeId"] == "EMP-001"
+    assert 18 not in pipeline.track_employee_binding
+
+
+def test_badge_binding_promotes_transient_state_without_duplicate_subject_keys(tmp_path) -> None:
+    pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
+    anonymous_key = "track:17"
+    pipeline.ppe_missing_since[(anonymous_key, "mask")] = 10.0
+    pipeline.ppe_recovery_since[(anonymous_key, "left_glove")] = 11.0
+    pipeline.ppe_observed_at[(anonymous_key, "right_glove")] = 12.0
+    pipeline.ppe_alerted.add((anonymous_key, "mask"))
+    pipeline.movement_zone[anonymous_key] = "Preparation"
+    pipeline.movement_candidate[anonymous_key] = ("Process Start", 13.0)
+    pipeline.movement_last_event[anonymous_key] = 14.0
+    marker = Marker(
+        101,
+        np.array([[80, 170], [120, 170], [120, 210], [80, 210]], dtype=np.float32),
+        (100, 190),
+        0.98,
+    )
+
+    pipeline._bind_track_identity(17, EMPLOYEE_MARKERS[101], marker, time.monotonic())
+
+    assert pipeline.ppe_missing_since[("EMP-001", "mask")] == 10.0
+    assert pipeline.ppe_recovery_since[("EMP-001", "left_glove")] == 11.0
+    assert pipeline.ppe_observed_at[("EMP-001", "right_glove")] == 12.0
+    assert ("EMP-001", "mask") in pipeline.ppe_alerted
+    assert not any(key[0] == anonymous_key for key in pipeline.ppe_missing_since)
+    assert not any(key[0] == anonymous_key for key in pipeline.ppe_recovery_since)
+    assert not any(key[0] == anonymous_key for key in pipeline.ppe_observed_at)
+    assert not any(key[0] == anonymous_key for key in pipeline.ppe_alerted)
+    assert pipeline.movement_zone["EMP-001"] == "Preparation"
+    assert pipeline.movement_candidate["EMP-001"] == ("Process Start", 13.0)
+    assert pipeline.movement_last_event["EMP-001"] == 14.0
+    assert anonymous_key not in pipeline.movement_zone
+    assert anonymous_key not in pipeline.movement_candidate
+    assert anonymous_key not in pipeline.movement_last_event
+
+
+def test_conflicting_badge_cannot_replace_an_active_track_identity(tmp_path) -> None:
+    pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
+    marker_101 = Marker(101, np.empty((4, 2)), (100, 190), 0.98)
+    marker_102 = Marker(102, np.empty((4, 2)), (100, 190), 0.99)
+
+    first = pipeline._bind_track_identity(
+        17, EMPLOYEE_MARKERS[101], marker_101, time.monotonic()
+    )
+    conflict = pipeline._bind_track_identity(
+        17, EMPLOYEE_MARKERS[102], marker_102, time.monotonic()
+    )
+
+    assert first["employeeId"] == "EMP-001"
+    assert conflict["employeeId"] == "EMP-001"
+    assert pipeline.track_employee_binding[17]["employeeId"] == "EMP-001"
+    assert pipeline.track_employee_binding_confidence[17] == 0.98
 
 
 def test_staff_activity_uses_zone_and_active_process_without_inferring_intent(tmp_path) -> None:

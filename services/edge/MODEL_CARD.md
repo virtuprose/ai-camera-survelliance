@@ -3,7 +3,7 @@
 ## Implemented pipeline
 
 - Person and pose detection: `yolo11n-pose.pt` with ByteTrack supplies the person box plus face, shoulder, elbow, wrist, and hip keypoints. CPU is the selected M1 runtime because Ultralytics emits a known pose warning for Apple MPS.
-- Employee identity: optional ArUco 4x4 badges `101` and `102`; facial recognition is not implemented.
+- Employee identity: optional ArUco 4x4 badges `101` and `102`; once verified, identity remains bound to the same active person track through badge occlusion. The binding is retained for up to 30 seconds of track loss but is restored only when the tracker returns the same track ID. A new or expired track must present an approved identity source again. Facial recognition and appearance-based re-identification are not implemented.
 - PPE: `Landmark-gated controlled PPE verifier v4` uses an item-specific controlled profile: blue mask, red gloves, and blue monitor-only hairnet/apron. It measures only inside pose-landmark-derived face, head, left/right hand, and torso regions. It requires a central connected configured-colour shape; the mask policy accommodates the expected lower-face placement of a surgical mask while retaining coverage, component, span, and quality gates. Total colour pixels alone cannot produce a positive result. It is not a general PPE classifier.
 - Tray and inventory: ArUco tags `201` and `301`–`305` with zone/line rules.
 

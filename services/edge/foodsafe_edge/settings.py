@@ -28,7 +28,9 @@ class Settings(BaseSettings):
     ppe_persistence_seconds: float = 3.0
     ppe_recovery_seconds: float = 5.0
     identity_persistence_seconds: float = 3.0
-    identity_binding_seconds: float = 5.0
+    # Keep a badge-verified identity available while its person track is active.
+    # This value is only the grace period after that track disappears.
+    identity_binding_seconds: float = 30.0
     ppe_keypoint_confidence: float = 0.45
     ppe_minimum_brightness: float = 55.0
     ppe_mask_colour: Literal["blue", "red"] = "blue"

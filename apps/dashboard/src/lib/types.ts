@@ -8,6 +8,7 @@ export type PpeAssessmentState = "not_visible" | "checking" | "detected" | "miss
 
 export interface PpeItemAssessment {
   state: PpeAssessmentState;
+  observationState?: PpeAssessmentState | null;
   confidence: number | null;
   visibilityConfidence: number;
   blueRatio: number | null;
@@ -56,6 +57,8 @@ export interface ActiveEmployee {
   photoUrl?: string | null;
   badgeMarkerId?: number | null;
   identityMethod?: "aruco_badge";
+  identityAssociation?: "badge_visible" | "track_session" | "not_associated";
+  identityVerifiedAt?: string | null;
   trackId: number | null;
   zone: string;
   activity: string;

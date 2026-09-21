@@ -128,11 +128,39 @@ test("mobile navigation and expanded operational tools remain accessible", async
 });
 
 test("badge identity works without profile imagery", async ({ page }) => {
-  await page.route("**/api/edge/api/state", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...fallbackState, activeEmployee: { employeeId: "EMP-002", displayName: "Demo Operator B", photoUrl: null, badgeMarkerId: 102, identityMethod: "aruco_badge", trackId: 12, zone: "Preparation", activity: "Working in preparation", enteredAt: new Date().toISOString(), timeInZoneSeconds: 12, badgeConfidence: 0.99, ppe: { mask: null, gloves: null, hairnet: null, apron: null, confidence: null } } }) }));
+  const verifiedAt = new Date().toISOString();
+  await page.route("**/api/edge/api/state", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...fallbackState, activeEmployee: { employeeId: "EMP-002", displayName: "Muhammad Zaid", photoUrl: null, badgeMarkerId: 102, identityMethod: "aruco_badge", identityAssociation: "badge_visible", identityVerifiedAt: verifiedAt, trackId: 12, zone: "Preparation", activity: "Working in preparation", enteredAt: verifiedAt, timeInZoneSeconds: 12, badgeConfidence: 0.99, ppe: { mask: null, gloves: null, hairnet: null, apron: null, confidence: null } } }) }));
   await page.goto("/live", { waitUntil: "domcontentloaded" });
-  await expect(page.getByText("Demo Operator B", { exact: true })).toBeVisible();
-  await expect(page.getByText("Identified by badge 102 · no biometric matching", { exact: true })).toBeVisible();
+  await expect(page.getByText("Muhammad Zaid", { exact: true })).toBeVisible();
+  await expect(page.getByText("Badge 102 visible · identity verified on Track 12 · no biometric matching", { exact: true })).toBeVisible();
   await expect(page.locator(".employee-avatar img")).toHaveCount(0);
+});
+
+test("badge identity remains visibly associated after badge occlusion", async ({ page }) => {
+  const verifiedAt = new Date().toISOString();
+  const activeEmployee = {
+    employeeId: "EMP-002", displayName: "Muhammad Zaid", photoUrl: null,
+    badgeMarkerId: 102, identityMethod: "aruco_badge", identityAssociation: "track_session",
+    identityVerifiedAt: verifiedAt, trackId: 12, zone: "Preparation",
+    activity: "Present in preparation area", enteredAt: verifiedAt,
+    timeInZoneSeconds: 12, badgeConfidence: 0.99, personConfidence: 0.97,
+    ppe: { mask: null, gloves: null, hairnet: null, apron: null, confidence: null },
+  };
+  await page.route("**/api/edge/api/state", async (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ ...fallbackState, activeEmployee }),
+  }));
+
+  await page.goto("/live", { waitUntil: "domcontentloaded" });
+  await expect(page.getByText("Identity retained", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Identity retained on Track 12 · badge 102 verified .* · no biometric matching/)).toBeVisible();
+  await expectAccessible(page);
+  await page.screenshot({ path: "test-results/screenshots/identity-retained-live.png", fullPage: true, animations: "disabled" });
+
+  await page.goto("/staff", { waitUntil: "domcontentloaded" });
+  await expect(page.getByText("Identity retained", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Identity retained on Track 12; badge 102 verified/)).toBeVisible();
+  await expectAccessible(page);
 });
 
 test("automatic PPE monitoring is ready without a manual acceptance command", async ({ page }) => {

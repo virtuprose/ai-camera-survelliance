@@ -59,6 +59,7 @@ PPE_LABELS = {
 def _item_payload(item: PPEItemResult, required: bool) -> dict[str, Any]:
     return {
         "state": item.state,
+        "observationState": item.observation_state,
         "confidence": item.confidence,
         "visibilityConfidence": item.visibility_confidence,
         "blueRatio": item.blue_ratio,
@@ -171,6 +172,7 @@ class EdgePipeline:
         self.track_last_seen: dict[int, float] = {}
         self.track_employee_binding: dict[int, dict[str, Any]] = {}
         self.track_employee_binding_seen: dict[int, float] = {}
+        self.track_employee_binding_verified_at: dict[int, str] = {}
         self.track_employee_binding_confidence: dict[int, float] = {}
         self.track_paths: dict[int, deque[tuple[int, int]]] = {}
         self.movement_zone: dict[str, str] = {}
@@ -403,6 +405,34 @@ class EdgePipeline:
             self._fps_frames = 0
             self._fps_started = time.monotonic()
 
+    @staticmethod
+    def _assign_employee_markers(
+        people: list[PersonDetection], markers: list[Marker]
+    ) -> dict[int, Marker]:
+        """Associate each badge with at most one containing person track."""
+        candidates: list[tuple[float, float, int, int, Marker]] = []
+        for person in people:
+            person_x, person_y = _centre(person.xyxy)
+            for marker_index, marker in enumerate(markers):
+                if not _contains(person.xyxy, marker.centre):
+                    continue
+                distance = float(
+                    np.hypot(person_x - marker.centre[0], person_y - marker.centre[1])
+                )
+                candidates.append(
+                    (distance, -marker.confidence, person.track_id, marker_index, marker)
+                )
+        assignments: dict[int, Marker] = {}
+        assigned_markers: set[int] = set()
+        for _distance, _confidence, track_id, marker_index, marker in sorted(
+            candidates, key=lambda candidate: candidate[:4]
+        ):
+            if track_id in assignments or marker_index in assigned_markers:
+                continue
+            assignments[track_id] = marker
+            assigned_markers.add(marker_index)
+        return assignments
+
     def _process(self, frame: np.ndarray) -> np.ndarray:
         height, width = frame.shape[:2]
         people = self.detector.detect(frame) if self.detector else []
@@ -410,13 +440,21 @@ class EdgePipeline:
         employee_markers = [marker for marker in markers if marker.marker_id in EMPLOYEE_MARKERS]
         draw_zones(frame)
         self._handle_process_and_inventory(markers, frame)
+        employee_marker_by_track = self._assign_employee_markers(people, employee_markers)
 
         resolved_employee = False
         resolved_subject = False
         for person in people:
-            matched = next(
-                (marker for marker in employee_markers if _contains(person.xyxy, marker.centre)), None
-            )
+            observed_at = time.monotonic()
+            previous_track_seen = self.track_last_seen.get(person.track_id)
+            if (
+                previous_track_seen is not None
+                and observed_at - previous_track_seen > self.settings.identity_binding_seconds
+            ):
+                self._clear_track_identity(person.track_id)
+            self.track_first_seen.setdefault(person.track_id, iso())
+            self.track_last_seen[person.track_id] = observed_at
+            matched = employee_marker_by_track.get(person.track_id)
             ppe = self.ppe_stabilizer.update(
                 person.track_id,
                 self.ppe_detector.detect(frame, person),
@@ -424,18 +462,16 @@ class EdgePipeline:
             if matched:
                 employee = EMPLOYEE_MARKERS.get(matched.marker_id)
                 if employee:
-                    self.track_employee_binding[person.track_id] = employee
-                    self.track_employee_binding_seen[person.track_id] = time.monotonic()
-                    self.track_employee_binding_confidence[person.track_id] = matched.confidence
+                    employee = self._bind_track_identity(
+                        person.track_id, employee, matched, observed_at
+                    )
+                    if employee["badgeMarkerId"] != matched.marker_id:
+                        matched = None
             else:
-                binding_age = time.monotonic() - self.track_employee_binding_seen.get(
-                    person.track_id, 0
-                )
-                employee = (
-                    self.track_employee_binding.get(person.track_id)
-                    if binding_age <= self.settings.identity_binding_seconds
-                    else None
-                )
+                # A badge verifies the person track once. Keep that identity for the
+                # complete visible track session; the configured timeout applies only
+                # after the person track disappears, never to badge occlusion.
+                employee = self.track_employee_binding.get(person.track_id)
             person_zone = zone_for(_centre(person.xyxy), width, height)
             self._draw_person(frame, person, ppe, employee, person_zone)
             self._check_identity(employee, person, person_zone, frame)
@@ -451,6 +487,7 @@ class EdgePipeline:
                     else self.track_employee_binding_confidence.get(person.track_id, 0.5),
                     person_zone,
                     ppe,
+                    badge_visible=matched is not None,
                 )
                 self._check_ppe(employee, person, person_zone, ppe, frame)
                 self._check_movement(employee, person, person_zone, frame)
@@ -471,6 +508,8 @@ class EdgePipeline:
                 "photoUrl": employee.get("photoUrl"),
                 "badgeMarkerId": employee["badgeMarkerId"],
                 "identityMethod": "aruco_badge",
+                "identityAssociation": "badge_visible",
+                "identityVerifiedAt": iso(),
                 "trackId": None,
                 "zone": marker_zone,
                 "activity": "Badge visible · waiting for person track",
@@ -491,12 +530,16 @@ class EdgePipeline:
                 self.employee_first_seen.pop(employee_id, None)
                 self.employee_last_seen.pop(employee_id, None)
         for track_id, last_seen in list(self.track_last_seen.items()):
-            if now - last_seen > 10:
+            track_absence = now - last_seen
+            if track_absence > self.settings.identity_binding_seconds:
+                self._clear_track_identity(track_id)
+            if track_absence > max(10, self.settings.identity_binding_seconds):
                 self.track_first_seen.pop(track_id, None)
                 self.track_last_seen.pop(track_id, None)
                 self.track_paths.pop(track_id, None)
                 self.track_employee_binding.pop(track_id, None)
                 self.track_employee_binding_seen.pop(track_id, None)
+                self.track_employee_binding_verified_at.pop(track_id, None)
                 self.track_employee_binding_confidence.pop(track_id, None)
                 subject_key = f"track:{track_id}"
                 self.movement_zone.pop(subject_key, None)
@@ -510,6 +553,59 @@ class EdgePipeline:
         self._draw_header(frame)
         return frame
 
+    def _clear_track_identity(self, track_id: int) -> None:
+        """Expire only the optional identity association for one person track."""
+        self.track_employee_binding.pop(track_id, None)
+        self.track_employee_binding_seen.pop(track_id, None)
+        self.track_employee_binding_verified_at.pop(track_id, None)
+        self.track_employee_binding_confidence.pop(track_id, None)
+
+    def _bind_track_identity(
+        self,
+        track_id: int,
+        employee: dict[str, Any],
+        marker: Marker,
+        observed_at: float,
+    ) -> dict[str, Any]:
+        """Verify a badge and preserve transient state while resolving its track."""
+        previous = self.track_employee_binding.get(track_id)
+        if previous is not None and previous["employeeId"] != employee["employeeId"]:
+            # Never replace an active session identity with a conflicting badge in
+            # the same track. A reset/expiry must establish a new session first.
+            return previous
+        if previous is None:
+            anonymous_key = f"track:{track_id}"
+            employee_key = employee["employeeId"]
+            for state in (
+                self.ppe_missing_since,
+                self.ppe_recovery_since,
+                self.ppe_observed_at,
+            ):
+                for item in ITEM_ORDER:
+                    anonymous_item = (anonymous_key, item)
+                    employee_item = (employee_key, item)
+                    if anonymous_item in state and employee_item not in state:
+                        state[employee_item] = state[anonymous_item]
+                    state.pop(anonymous_item, None)
+            for item in ITEM_ORDER:
+                anonymous_item = (anonymous_key, item)
+                if anonymous_item in self.ppe_alerted:
+                    self.ppe_alerted.add((employee_key, item))
+                    self.ppe_alerted.discard(anonymous_item)
+            for state in (
+                self.movement_zone,
+                self.movement_candidate,
+                self.movement_last_event,
+            ):
+                if anonymous_key in state and employee_key not in state:
+                    state[employee_key] = state[anonymous_key]
+                state.pop(anonymous_key, None)
+        self.track_employee_binding[track_id] = employee
+        self.track_employee_binding_seen[track_id] = observed_at
+        self.track_employee_binding_verified_at[track_id] = iso()
+        self.track_employee_binding_confidence[track_id] = marker.confidence
+        return employee
+
     def _set_active_employee(
         self,
         employee: dict[str, str],
@@ -517,6 +613,8 @@ class EdgePipeline:
         badge_confidence: float,
         person_zone: str,
         ppe: PPEResult,
+        *,
+        badge_visible: bool,
     ) -> None:
         employee_id = employee["employeeId"]
         entered = self.employee_first_seen.setdefault(employee_id, iso())
@@ -532,6 +630,8 @@ class EdgePipeline:
             "photoUrl": employee.get("photoUrl"),
             "badgeMarkerId": employee["badgeMarkerId"],
             "identityMethod": "aruco_badge",
+            "identityAssociation": "badge_visible" if badge_visible else "track_session",
+            "identityVerifiedAt": self.track_employee_binding_verified_at.get(person.track_id),
             "trackId": person.track_id,
             "zone": person_zone,
             "activity": self._activity_context(person_zone),
@@ -562,6 +662,8 @@ class EdgePipeline:
             "displayName": "Unidentified staff member",
             "photoUrl": None,
             "badgeMarkerId": None,
+            "identityAssociation": "not_associated",
+            "identityVerifiedAt": None,
             "trackId": person.track_id,
             "zone": person_zone,
             "activity": self._activity_context(person_zone),
@@ -665,6 +767,10 @@ class EdgePipeline:
                 if key not in self.ppe_alerted:
                     self.ppe_recovery_since.pop(key, None)
                     continue
+                # A stabilized recovery may outlive a contrary frame. Retain
+                # evidence only when the current observation also supports it.
+                if assessment.observation_state not in {None, "detected"}:
+                    continue
                 recovered_since = self.ppe_recovery_since.setdefault(key, now)
                 if now - recovered_since < self.settings.ppe_recovery_seconds:
                     continue
@@ -699,6 +805,10 @@ class EdgePipeline:
                 continue
             since = self.ppe_missing_since.setdefault(key, now)
             if now - since < self.settings.ppe_persistence_seconds or key in self.ppe_alerted:
+                continue
+            # Rolling consensus intentionally resists one-frame changes, but a
+            # retained snapshot and its measurements must support the alert.
+            if assessment.observation_state not in {None, "missing"}:
                 continue
             # Retain deterministic safety ordering even when several items become
             # stable in the same frame. The next item is emitted on the next frame.
@@ -747,6 +857,7 @@ class EdgePipeline:
             "item": item,
             "side": assessment.side,
             "state": "detected" if recovered else "missing",
+            "observation_state": assessment.observation_state,
             "visibility_confidence": assessment.visibility_confidence,
             "decision_confidence": assessment.confidence,
             "blue_ratio": assessment.blue_ratio,
@@ -1322,7 +1433,9 @@ class EdgePipeline:
                 "state": "associated" if identity_detected else "not_associated",
                 "label": subject["displayName"] if identity_detected else "Identity not associated",
                 "detail": (
-                    "Resolved from an enrolled ArUco badge."
+                    "Badge is visible and verifies this active person track."
+                    if subject.get("identityAssociation") == "badge_visible"
+                    else "Badge was verified earlier; identity remains bound to this active person track."
                     if identity_detected
                     else "Optional badge or access-control association; PPE monitoring remains active."
                 ),
@@ -1361,6 +1474,7 @@ class EdgePipeline:
             self.track_last_seen.clear()
             self.track_employee_binding.clear()
             self.track_employee_binding_seen.clear()
+            self.track_employee_binding_verified_at.clear()
             self.track_employee_binding_confidence.clear()
             self.track_paths.clear()
             self.movement_zone.clear()
@@ -1448,7 +1562,7 @@ class EdgePipeline:
                         severity="critical",
                         source_mode="simulated",
                         employee_id="EMP-001",
-                        employee_name="Demo Operator A",
+                        employee_name="Ahmed Hassan",
                         zone="Preparation",
                         confidence=1.0,
                     ),
@@ -1480,7 +1594,7 @@ class EdgePipeline:
                         severity="warning",
                         source_mode="simulated",
                         employee_id="EMP-001",
-                        employee_name="Demo Operator A",
+                        employee_name="Ahmed Hassan",
                         zone="Process Complete",
                         confidence=1.0,
                     ),
@@ -1497,7 +1611,7 @@ class EdgePipeline:
                         severity="warning",
                         source_mode="simulated",
                         employee_id="EMP-002",
-                        employee_name="Demo Operator B",
+                        employee_name="Muhammad Zaid",
                         zone="Inventory",
                         confidence=1.0,
                     ),
@@ -1544,5 +1658,6 @@ class EdgePipeline:
             self.track_last_seen.clear()
             self.track_employee_binding.clear()
             self.track_employee_binding_seen.clear()
+            self.track_employee_binding_verified_at.clear()
             self.track_employee_binding_confidence.clear()
             return removed

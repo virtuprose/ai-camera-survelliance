@@ -38,6 +38,9 @@ class PPEItemResult:
     decision_reason: str | None = None
     expected_colour: PPEColour = "blue"
     colour_ratio: float | None = None
+    # Frame-level state before rolling-window stabilization. Retaining this
+    # prevents event evidence from contradicting the stabilized decision.
+    observation_state: AssessmentState | None = None
 
 
 @dataclass(slots=True)
@@ -337,6 +340,7 @@ class LandmarkColourPPEDetector:
                 side=side,
                 decision_reason="Required anatomical region is not reliably visible",
                 expected_colour=expected_colour,
+                observation_state="not_visible",
             )
         x1, y1, x2, y2 = roi
         evidence = self._colour_shape_evidence(
@@ -371,6 +375,7 @@ class LandmarkColourPPEDetector:
             decision_reason=reason,
             expected_colour=expected_colour,
             colour_ratio=evidence.ratio,
+            observation_state="detected" if detected else "missing",
         )
 
     def detect(self, frame: np.ndarray, person: PersonDetection) -> PPEResult:
@@ -404,6 +409,7 @@ class LandmarkColourPPEDetector:
                     self.thresholds[item],
                     side="left" if item == "left_glove" else "right" if item == "right_glove" else None,
                     expected_colour=self.colours[item],
+                    observation_state="unavailable",
                 )
                 for item in ITEM_ORDER
             }
@@ -671,6 +677,7 @@ class PPEStabilizer:
             stable_items[item_name] = replace(
                 item,
                 state=next_state,
+                observation_state=item.observation_state or item.state,
                 confidence=consensus if consensus is not None else item.confidence,
                 stable_for_ms=max(0, int((observed_at - self.stable_since.get(key, observed_at)) * 1000)),
             )

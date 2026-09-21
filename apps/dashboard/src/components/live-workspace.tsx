@@ -7,7 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Activity, AlertTriangle, BadgeCheck, Box, Camera, Check, CheckCircle2, CircleGauge, CircleX, Clock3, FileCheck2, MapPin, PackageCheck, Play, Radio, RotateCcw, ScanLine, ShieldAlert, ShieldCheck, Square, Thermometer, TimerOff, UserRound, WifiOff, X } from "lucide-react";
 import { resetDetection, runDemoAction, useEdgeState } from "@/hooks/use-edge";
 import { formatClock, formatDuration, formatRelative } from "@/lib/format";
-import type { DetectionState, DeviceHealth, PpeAssessmentState, PpeItemAssessment, PpeStatus, Severity } from "@/lib/types";
+import type { ActiveEmployee, DetectionState, DeviceHealth, PpeAssessmentState, PpeItemAssessment, PpeStatus, Severity } from "@/lib/types";
 import { PageHeader } from "@/components/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { LiveKitCamera } from "@/components/livekit-camera";
@@ -39,6 +39,20 @@ function EventIcon({ severity }: { severity: Severity }) {
 
 function confidence(value: number | null | undefined) {
   return value == null ? "Checking" : `${Math.round(value * 100)}%`;
+}
+
+function identityBadgeLabel(employee: ActiveEmployee) {
+  if (!employee.employeeId) return "Identity optional";
+  return employee.identityAssociation === "track_session" ? "Identity retained" : "Badge identified";
+}
+
+function identityAssociationText(employee: ActiveEmployee, referenceTime: number) {
+  if (!employee.employeeId) return "PPE monitoring is active without employee identification. Badge or access-control matching can be added later.";
+  if (employee.identityAssociation === "track_session") {
+    const verified = formatRelative(employee.identityVerifiedAt ?? null, referenceTime);
+    return `Identity retained on Track ${employee.trackId ?? "—"} · badge ${employee.badgeMarkerId ?? "—"} verified ${verified} · no biometric matching`;
+  }
+  return `Badge ${employee.badgeMarkerId ?? "—"} visible · identity verified on Track ${employee.trackId ?? "—"} · no biometric matching`;
 }
 
 const PPE_ITEM_LABELS: Record<string, string> = { mask: "Mask", left_glove: "Left glove", right_glove: "Right glove", hairnet: "Hairnet", apron: "Apron" };
@@ -236,7 +250,7 @@ export function LiveWorkspace() {
 
         <div className="metric-split"><article className={`metric-panel temperature-panel tone-${state.temperature.status}`}><div className="section-label"><Thermometer /><span>Temperature</span></div><div className="primary-reading">{state.temperature.valueC.toFixed(1)}<small>°C</small></div><span className="subtle">Safe range {state.temperature.minC}–{state.temperature.maxC}°C</span><StatusBadge tone={state.temperature.sourceMode === "simulated" ? "simulated" : "safe"} label={state.temperature.sourceMode === "simulated" ? "Simulated sensor" : "Live sensor"} /></article><article className="metric-panel inventory-panel"><div className="section-label"><Box /><span>Inventory</span></div><div className="primary-reading">{inventoryTotal}<small>items</small></div><span className="subtle">Across {state.inventory.length} tagged SKUs</span><span className="tiny-state"><PackageCheck />Stable tagged-crossing rule active</span></article></div>
 
-        <article className="metric-panel employee-panel"><div className="section-label"><UserRound /><span>Staff & PPE</span>{employee && <StatusBadge tone={employee.employeeId ? "safe" : "info"} label={employee.employeeId ? "Badge identified" : "Identity optional"} />}</div>{employee ? <><div className="employee-identity"><Avatar className="employee-avatar">{employee.photoUrl ? <AvatarImage src={employee.photoUrl} alt="" /> : null}<AvatarFallback>{employee.employeeId ? employee.displayName.slice(0, 2).toUpperCase() : "US"}</AvatarFallback></Avatar><div><strong>{employee.displayName}</strong><span>{employee.employeeId ?? `Track ${employee.trackId ?? "—"}`} · {employee.zone}</span></div>{employee.employeeId ? <BadgeCheck className="safe-icon" aria-label="Badge resolved" /> : <UserRound className="info-icon" aria-label="Identity not required" />}</div><p className="identity-method">{employee.employeeId ? <><BadgeCheck />Identified by badge {employee.badgeMarkerId ?? "—"}{employee.photoUrl ? " · profile photo for operator reference" : " · no biometric matching"}</> : <><ShieldCheck />PPE monitoring is active without employee identification. Badge or access-control matching can be added later.</>}</p><PpeGrid ppe={employee.ppe} /><div className="metric-foot"><span>{employee.activity}</span><span>Signal confidence {employee.ppe.confidence ? `${Math.round(employee.ppe.confidence * 100)}%` : "checking"}</span></div></> : <div className="empty-compact"><UserRound /><strong>No staff member in view</strong><span>Automatic PPE monitoring is active and waiting for a person. An employee badge is optional.</span></div>}</article>
+        <article className="metric-panel employee-panel"><div className="section-label"><UserRound /><span>Staff & PPE</span>{employee && <StatusBadge tone={employee.employeeId ? "safe" : "info"} label={identityBadgeLabel(employee)} />}</div>{employee ? <><div className="employee-identity"><Avatar className="employee-avatar">{employee.photoUrl ? <AvatarImage src={employee.photoUrl} alt="" /> : null}<AvatarFallback>{employee.employeeId ? employee.displayName.slice(0, 2).toUpperCase() : "US"}</AvatarFallback></Avatar><div><strong>{employee.displayName}</strong><span>{employee.employeeId ?? `Track ${employee.trackId ?? "—"}`} · {employee.zone}</span></div>{employee.employeeId ? <BadgeCheck className="safe-icon" aria-label={employee.identityAssociation === "track_session" ? "Identity retained on active track" : "Badge identity verified"} /> : <UserRound className="info-icon" aria-label="Identity not required" />}</div><p className="identity-method">{employee.employeeId ? <BadgeCheck /> : <ShieldCheck />}{identityAssociationText(employee, referenceTime)}</p><PpeGrid ppe={employee.ppe} /><div className="metric-foot"><span>{employee.activity}</span><span>Signal confidence {employee.ppe.confidence ? `${Math.round(employee.ppe.confidence * 100)}%` : "checking"}</span></div></> : <div className="empty-compact"><UserRound /><strong>No staff member in view</strong><span>Automatic PPE monitoring is active and waiting for a person. An employee badge is optional.</span></div>}</article>
       </aside>
     </section>
 

@@ -75,8 +75,9 @@ The **Change source** menu can switch among cameras exposed by macOS, an RTSP so
 
 Printable ArUco markers are stored in `services/edge/assets/markers/`:
 
-- `101`: Demo Operator A (`EMP-001`)
-- `102`: Demo Operator B (`EMP-002`)
+- `101`: Ahmed Hassan (`EMP-001`)
+- `102`: Muhammad Zaid (`EMP-002`)
+- `103`: Fatima Ali (`EMP-003`)
 - `201`: process tray `TRAY-01`
 - `301`–`305`: five sample inventory items
 

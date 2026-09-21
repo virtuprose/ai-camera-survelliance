@@ -4,7 +4,7 @@
 
 1. Place the camera in a fixed position with the full operator, preparation bench, start/complete areas, and inventory line visible.
 2. Print the marker images in `services/edge/assets/markers/`; keep black borders flat and unobstructed.
-3. Keep employee badge `101` (Demo Operator A) or `102` (Demo Operator B) available only as an optional identity demonstration. Begin PPE monitoring without a badge. Use tray `201` and product `301` for the short presentation.
+3. Keep employee badge `101` (Ahmed Hassan), `102` (Muhammad Zaid), or `103` (Fatima Ali) available only as an optional identity demonstration. Begin PPE monitoring without a badge. Use tray `201` and product `301` for the short presentation.
 4. Use a blue mask and both red gloves for the controlled PPE demonstration. Hairnet and apron are monitor-only until separately enabled and calibrated.
 5. Run `bun run local`; it starts the edge service, dashboard, and automatic monitoring together. Confirm the automatic status on **Live Operations** and every item on **System status**.
 6. Run the scripted scenario once and restart both services before the client joins.

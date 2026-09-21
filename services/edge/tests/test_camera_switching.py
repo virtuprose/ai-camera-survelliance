@@ -30,6 +30,66 @@ def test_avfoundation_discovery_returns_video_devices_only(monkeypatch) -> None:
     }
 
 
+def test_avfoundation_discovery_uses_native_macos_when_ffmpeg_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(camera_module, "_discover_with_ffmpeg", lambda: {})
+    monkeypatch.setattr(
+        camera_module,
+        "_discover_with_native_avfoundation",
+        lambda: {
+            "Samsung SlimFit Cam": "0",
+            "MacBook Pro Camera": "1",
+            "Zaid’s iPhone Camera": "2",
+        },
+    )
+    monkeypatch.setattr(
+        camera_module,
+        "_discover_with_system_profiler",
+        lambda: pytest.fail("system_profiler should not run after native discovery succeeds"),
+    )
+
+    assert camera_module.discover_avfoundation_devices() == {
+        "Samsung SlimFit Cam": "0",
+        "MacBook Pro Camera": "1",
+        "Zaid’s iPhone Camera": "2",
+    }
+
+
+def test_avfoundation_discovery_falls_back_to_system_profiler(monkeypatch) -> None:
+    monkeypatch.setattr(camera_module, "_discover_with_ffmpeg", lambda: {})
+    monkeypatch.setattr(camera_module, "_discover_with_native_avfoundation", lambda: {})
+    monkeypatch.setattr(
+        camera_module,
+        "_discover_with_system_profiler",
+        lambda: {"USB Conference Camera": "0"},
+    )
+
+    assert camera_module.discover_avfoundation_devices() == {"USB Conference Camera": "0"}
+
+
+def test_legacy_facetime_label_resolves_to_current_macbook_camera(monkeypatch) -> None:
+    monkeypatch.setattr(
+        camera_module,
+        "discover_avfoundation_devices",
+        lambda: {
+            "Samsung SlimFit Cam": "0",
+            "Zaid’s iPhone Camera": "1",
+            "MacBook Pro Camera": "2",
+        },
+    )
+    settings = Settings(
+        camera_enabled=False,
+        camera_kind="avfoundation",
+        camera_source="0",
+        camera_label="FaceTime HD Camera",
+    )
+
+    camera_module.resolve_avfoundation_source(settings)
+
+    assert settings.camera_label == "MacBook Pro Camera"
+    assert settings.camera_source == "2"
+    assert camera_module.camera_id_for_label(settings.camera_label) == "facetime"
+
+
 def test_camera_catalog_uses_stable_label_when_indexes_reorder(monkeypatch) -> None:
     monkeypatch.setattr(
         camera_module,
