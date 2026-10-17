@@ -196,20 +196,30 @@ def test_dynamic_camera_id_is_stable_when_indexes_reorder(monkeypatch) -> None:
 
 class FakeCamera:
     fail_labels: set[str] = set()
+    unreadable_labels: set[str] = set()
+    active_count = 0
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.closed = False
+        self.closed = True
 
     def open(self) -> bool:
-        return self.settings.camera_label not in self.fail_labels
+        if self.active_count:
+            raise AssertionError("A previous camera capture is still open")
+        if self.settings.camera_label in self.fail_labels:
+            return False
+        self.closed = False
+        type(self).active_count += 1
+        return True
 
     def read(self):
-        if self.settings.camera_label in self.fail_labels:
+        if self.closed or self.settings.camera_label in self.unreadable_labels:
             return False, None
         return True, np.zeros((720, 1280, 3), dtype=np.uint8)
 
     def close(self) -> None:
+        if not self.closed:
+            type(self).active_count -= 1
         self.closed = True
 
 
@@ -242,10 +252,13 @@ def fake_catalog(settings: Settings) -> dict[str, object]:
 
 def test_switch_camera_commits_only_after_fresh_frame(monkeypatch, tmp_path) -> None:
     FakeCamera.fail_labels = set()
+    FakeCamera.unreadable_labels = set()
+    FakeCamera.active_count = 0
     monkeypatch.setattr(pipeline_module, "OpenCVCameraSource", FakeCamera)
     monkeypatch.setattr(pipeline_module, "camera_catalog", fake_catalog)
     pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
     previous = pipeline.camera
+    assert previous.open()
 
     result = pipeline.switch_camera("camo")
 
@@ -253,21 +266,60 @@ def test_switch_camera_commits_only_after_fresh_frame(monkeypatch, tmp_path) -> 
     assert pipeline.settings.camera_source == "1"
     assert previous.closed is True
     assert pipeline.camera.closed is False
+    assert FakeCamera.active_count == 1
     assert result["activeId"] == "camo"
     assert result["switchState"] == "idle"
 
 
-def test_failed_switch_preserves_current_camera(monkeypatch, tmp_path) -> None:
+def test_failed_switch_reopens_previous_camera_after_releasing_capture(monkeypatch, tmp_path) -> None:
     FakeCamera.fail_labels = {"Camo Camera"}
+    FakeCamera.unreadable_labels = set()
+    FakeCamera.active_count = 0
     monkeypatch.setattr(pipeline_module, "OpenCVCameraSource", FakeCamera)
     monkeypatch.setattr(pipeline_module, "camera_catalog", fake_catalog)
     pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
     previous = pipeline.camera
+    assert previous.open()
 
-    with pytest.raises(CameraSwitchError, match="could not be opened"):
+    with pytest.raises(CameraSwitchError, match="could not be opened.*restored"):
         pipeline.switch_camera("camo")
 
-    assert pipeline.camera is previous
-    assert previous.closed is False
+    assert pipeline.camera is not previous
+    assert previous.closed is True
+    assert pipeline.camera.closed is False
+    assert FakeCamera.active_count == 1
     assert pipeline.settings.camera_label == "FaceTime HD Camera"
     assert pipeline.camera_switch_state == "failed"
+
+
+def test_failed_frame_validation_restores_previous_camera(monkeypatch, tmp_path) -> None:
+    FakeCamera.fail_labels = set()
+    FakeCamera.unreadable_labels = {"Camo Camera"}
+    FakeCamera.active_count = 0
+    monkeypatch.setattr(pipeline_module, "OpenCVCameraSource", FakeCamera)
+    monkeypatch.setattr(pipeline_module, "camera_catalog", fake_catalog)
+    pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
+    assert pipeline.camera.open()
+
+    with pytest.raises(CameraSwitchError, match="did not provide fresh frames.*restored"):
+        pipeline.switch_camera("camo")
+
+    assert pipeline.camera.settings.camera_label == "FaceTime HD Camera"
+    assert pipeline.camera_online is True
+    assert FakeCamera.active_count == 1
+
+
+def test_offline_active_camera_can_be_reopened(monkeypatch, tmp_path) -> None:
+    FakeCamera.fail_labels = set()
+    FakeCamera.unreadable_labels = set()
+    FakeCamera.active_count = 0
+    monkeypatch.setattr(pipeline_module, "OpenCVCameraSource", FakeCamera)
+    monkeypatch.setattr(pipeline_module, "camera_catalog", fake_catalog)
+    pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
+
+    result = pipeline.switch_camera("facetime")
+
+    assert result["activeId"] == "facetime"
+    assert result["switchState"] == "idle"
+    assert pipeline.camera_online is True
+    assert FakeCamera.active_count == 1

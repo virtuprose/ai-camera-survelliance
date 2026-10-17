@@ -7,6 +7,7 @@ const routes = [
   ["/food-safety", "Food safety & PPE"], ["/processes", "Process assurance"],
   ["/staff", "Staff visibility"], ["/cold-chain", "Cold chain"], ["/inventory", "Inventory"],
   ["/incidents", "Incidents & evidence"], ["/reports", "Reports & audit"],
+  ["/ai-supervisor", "AI operations supervisor"], ["/preflight", "Client demo preflight"],
   ["/platform", "Platform"],
 ] as const;
 
@@ -101,6 +102,132 @@ test("reports export CSV and PDF audit artifacts", async ({ page }) => {
   await expect(page.getByText(/Unknown checks are retained but excluded/i)).toBeVisible();
 });
 
+test("AI foundation fails safely without credentials and rejects client-supplied images", async ({ page }) => {
+  const statusResponse = await page.request.get("http://127.0.0.1:8787/api/ai/status");
+  expect(statusResponse.ok()).toBeTruthy();
+  const status = await statusResponse.json() as {
+    configured: boolean; available: boolean; model: string; localMonitoringUnaffected: boolean;
+  };
+  expect(status).toMatchObject({
+    configured: false,
+    available: false,
+    model: "gpt-5.6-terra",
+    localMonitoringUnaffected: true,
+  });
+
+  const createResponse = await page.request.post("http://127.0.0.1:8787/api/ai/jobs", {
+    data: {
+      action: "provider_smoke",
+      sourceRecordIds: ["health-e2e"],
+      facts: { purpose: "configuration check" },
+    },
+  });
+  expect(createResponse.status()).toBe(202);
+  const job = await createResponse.json() as {
+    id: string; status: string; failure: { code: string }; sourceRecordIds: string[];
+  };
+  expect(job.status).toBe("unavailable");
+  expect(job.failure.code).toBe("missing_api_key");
+  expect(job.sourceRecordIds).toEqual(["health-e2e"]);
+
+  const readResponse = await page.request.get(`http://127.0.0.1:8787/api/ai/jobs/${job.id}`);
+  expect(readResponse.ok()).toBeTruthy();
+  expect((await readResponse.json()).id).toBe(job.id);
+
+  const blockedImage = await page.request.post("http://127.0.0.1:8787/api/ai/jobs", {
+    data: { action: "review_ppe", facts: { image: "blocked" } },
+  });
+  expect(blockedImage.status()).toBe(422);
+
+  const health = await page.request.get("http://127.0.0.1:8787/health");
+  expect(health.ok()).toBeTruthy();
+
+  const noPersonReview = await page.request.post("http://127.0.0.1:8787/api/ai/ppe/review");
+  expect(noPersonReview.status()).toBe(409);
+});
+
+test("AI operations and preflight fail closed until current release evidence exists", async ({ page }) => {
+  await page.goto("/ai-supervisor", { waitUntil: "domcontentloaded" });
+  await expectAppReady(page);
+  await expect(page.getByText("0/7", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Run analysis" })).toBeDisabled();
+  await expect(page.getByText(/Local records remain authoritative/i).first()).toBeVisible();
+  await expectAccessible(page);
+
+  const blockedRun = await page.request.post("http://127.0.0.1:8787/api/ai/actions/review_operations");
+  expect(blockedRun.status()).toBe(409);
+
+  await page.goto("/preflight", { waitUntil: "domcontentloaded" });
+  await expect(page.getByText("Client mode remains blocked", { exact: true })).toBeVisible();
+  await expect(page.getByText("Unverified actions remain disabled. Provider stubs are never shown as live AI.", { exact: true })).toBeVisible();
+  await expect(page.getByText("PPE 30/30 acceptance", { exact: true })).toBeVisible();
+  await expectAccessible(page);
+});
+
+test("AI PPE Assurance keeps local and advisory decisions separate", async ({ page }) => {
+  const observedAt = new Date().toISOString();
+  const assurance = {
+    ...fallbackState.aiPpeAssurance,
+    provider: {
+      ...fallbackState.aiPpeAssurance.provider,
+      configured: true,
+      available: true,
+      lastSuccessfulJobAt: observedAt,
+    },
+    readiness: {
+      ready: true,
+      regions: ["mask"],
+      unavailableRegions: ["left_glove", "right_glove"],
+      guidance: null,
+    },
+    latestJob: {
+      id: "ai-ppe-e2e",
+      action: "review_ppe",
+      status: "needs_review",
+      sourceRecordIds: ["camera-state:e2e"],
+      model: "gpt-5.6-terra",
+      promptVersion: "phase3-ppe-assurance-v1",
+      result: {
+        assurance: "needs_human_review",
+        regions: [{
+          region: "lower_face",
+          localDecision: "missing",
+          aiDecision: "present",
+          imageQuality: "adequate",
+          reason: "The reviewers disagree on the visible mask signal.",
+          agreement: false,
+        }],
+        sourceRecordIds: ["camera-state:e2e"],
+        evidence: { trackId: 17, trigger: "automatic", contactSheetsPersisted: false },
+        aiAssisted: true,
+        authoritativeSource: "local_edge",
+      },
+      latencyMs: 1820,
+      failure: null,
+      createdAt: observedAt,
+      completedAt: observedAt,
+    },
+  };
+  await page.route("**/api/edge/api/state", async (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({
+      ...fallbackState,
+      health: { ...fallbackState.health, edge: "online" },
+      aiPpeAssurance: assurance,
+    }),
+  }));
+
+  await page.goto("/live", { waitUntil: "domcontentloaded" });
+  const panel = page.getByRole("region", { name: "AI PPE Assurance" });
+  await expect(panel.getByText("Needs human review", { exact: true })).toBeVisible();
+  await expect(panel.getByText("Mask / lower face", { exact: true })).toBeVisible();
+  await expect(panel.getByText("Missing", { exact: true })).toBeVisible();
+  await expect(panel.getByText("Present", { exact: true })).toBeVisible();
+  await expect(panel.getByText(/cannot identify staff.*overwrite evidence/i)).toBeVisible();
+  await expectAccessible(page);
+  await page.screenshot({ path: "test-results/screenshots/ai-ppe-needs-review.png", fullPage: true, animations: "disabled" });
+});
+
 test("violation sound is muted until explicitly enabled", async ({ page }) => {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expectAppReady(page);
@@ -163,6 +290,50 @@ test("badge identity remains visibly associated after badge occlusion", async ({
   await expectAccessible(page);
 });
 
+test("identity session is clearly reassociated and can be cleared without deleting evidence", async ({ page }) => {
+  const verifiedAt = new Date(Date.now() - 120_000).toISOString();
+  const reassociatedAt = new Date().toISOString();
+  let cleared = false;
+  const activeEmployee = {
+    employeeId: "EMP-002", displayName: "Muhammad Zaid", photoUrl: null,
+    badgeMarkerId: 102, identityMethod: "aruco_badge", identityAssociation: "session_reentry",
+    identityVerifiedAt: verifiedAt, identityReassociatedAt: reassociatedAt,
+    identityPreviousTrackId: 12, identitySessionWindowSeconds: 600,
+    identitySessionExpiresInSeconds: 600, trackId: 41, zone: "Preparation",
+    activity: "Present in preparation area", enteredAt: verifiedAt,
+    timeInZoneSeconds: 122, badgeConfidence: 0.99, personConfidence: 0.97,
+    ppe: { mask: null, gloves: null, hairnet: null, apron: null, confidence: null },
+  };
+  const identitySessions = [{
+    employeeId: "EMP-002", displayName: "Muhammad Zaid", badgeMarkerId: 102,
+    cameraId: "facetime", status: "active", lastTrackId: 41, verifiedAt,
+    lastSeenAt: reassociatedAt, reassociatedAt, expiresInSeconds: 600,
+    windowSeconds: 600, association: "session_reentry",
+  }];
+  await page.route("**/api/edge/api/state", async (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ ...fallbackState, activeEmployee: cleared ? null : activeEmployee, identitySessions: cleared ? [] : identitySessions }),
+  }));
+  await page.route("**/api/edge/api/identity/sessions/clear", async (route) => {
+    cleared = true;
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, clearedSessions: 1, retainedEventsDeleted: 0 }) });
+  });
+
+  await page.goto("/live", { waitUntil: "domcontentloaded" });
+  await expect(page.getByText("Session reassociated", { exact: true })).toBeVisible();
+  await expect(page.getByText(/conservatively reassociated with the only eligible 10-minute session/)).toBeVisible();
+  await expectAccessible(page);
+  await page.screenshot({ path: "test-results/screenshots/identity-session-reassociated-live.png", fullPage: true, animations: "disabled" });
+
+  await page.goto("/platform", { waitUntil: "domcontentloaded" });
+  await page.getByRole("tab", { name: "Demo controls" }).click();
+  await expect(page.getByText(/remembered on this camera for 10:00/)).toBeVisible();
+  await page.getByRole("button", { name: "Clear identity session" }).click();
+  await expect(page.getByText(/1 identity session cleared\. Retained evidence was preserved\./)).toBeVisible();
+  await expectAccessible(page);
+  await page.screenshot({ path: "test-results/screenshots/identity-session-cleared-platform.png", fullPage: true, animations: "disabled" });
+});
+
 test("automatic PPE monitoring is ready without a manual acceptance command", async ({ page }) => {
   await page.route("**/api/edge/api/state", async (route) => route.fulfill({
     contentType: "application/json",
@@ -183,7 +354,10 @@ test("automatic PPE monitoring is ready without a manual acceptance command", as
   await page.goto("/live", { waitUntil: "domcontentloaded" });
   await expect(page.getByText("Live demo systems ready", { exact: true })).toBeVisible();
   await expect(page.getByText(/Camera fresh at 9\.6 FPS · PPE verifier self-test passed/i)).toBeVisible();
-  await expect(page.getByText("Automatic PPE monitoring is active and waiting for a person. An employee badge is optional.", { exact: true })).toBeVisible();
+  await expect(page.getByText(
+    "Automatic PPE monitoring is active and waiting for a person. An employee badge is optional.",
+    { exact: true },
+  ).first()).toBeVisible();
   await expectAccessible(page);
   await page.screenshot({ path: "test-results/screenshots/automatic-monitoring-ready.png", fullPage: true, animations: "disabled" });
 });
@@ -316,6 +490,42 @@ test("camera source selector lists discovered cameras and the labelled fallback"
   await expect(page.getByRole("button", { name: /Prerecorded local fallback.*Active/i })).toBeDisabled();
   await expect(page.getByText("Switched to Prerecorded local fallback.", { exact: true })).toBeVisible();
   await page.screenshot({ path: "test-results/screenshots/camera-source-selector.png", fullPage: true, animations: "disabled" });
+  await expectAccessible(page);
+});
+
+test("an offline selected camera offers a keyboard accessible retry", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  let attempts = 0;
+  const catalog = {
+    activeId: "facetime",
+    switchState: "idle",
+    message: "Switched to MacBook Pro Camera.",
+    options: [{ id: "facetime", label: "MacBook Pro Camera", description: "Built-in MacBook camera", kind: "avfoundation", source: "0", registered: true, active: true }],
+  };
+  await page.route("**/api/edge/api/state", async (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({
+      ...fallbackState,
+      health: { ...fallbackState.health, edge: "online", camera: attempts ? "online" : "offline", stream: attempts ? "online" : "offline", cameraId: "facetime", cameraLabel: "MacBook Pro Camera" },
+    }),
+  }));
+  await page.route("**/api/edge/api/cameras", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify(catalog) }));
+  await page.route("**/api/edge/api/cameras/active", async (route) => {
+    expect(((await route.request().postDataJSON()) as { cameraId: string }).cameraId).toBe("facetime");
+    attempts += 1;
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(catalog) });
+  });
+
+  await page.goto("/live", { waitUntil: "domcontentloaded" });
+  await expectAppReady(page);
+  await page.getByRole("button", { name: /Change camera source.*MacBook Pro Camera/i }).click();
+  const retry = page.getByRole("button", { name: "Retry MacBook Pro Camera" });
+  await expect(retry).toBeEnabled();
+  await page.screenshot({ path: "test-results/screenshots/camera-offline-retry-375.png", fullPage: true, animations: "disabled" });
+  await retry.focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => attempts).toBe(1);
+  await expect(page.getByRole("button", { name: /MacBook Pro Camera.*Active/i })).toBeDisabled();
   await expectAccessible(page);
 });
 

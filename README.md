@@ -69,7 +69,7 @@ The launcher starts both services:
 - Dashboard: `http://localhost:3000`
 - Edge API: `http://127.0.0.1:8787`
 
-The **Change source** menu can switch among cameras exposed by macOS, an RTSP source configured in the edge environment, and the included synthetic prerecorded fallback. A requested camera is accepted only after it supplies a fresh frame.
+The **Change source** menu can switch among cameras exposed by macOS, an RTSP source configured in the edge environment, and the included synthetic prerecorded fallback. Switching briefly releases the previous camera; the requested source must supply consecutive fresh frames. If it fails, the previous source is reopened and checked. An offline selected camera can be retried from the same menu.
 
 ## Demo markers and PPE profile
 
@@ -83,7 +83,7 @@ Printable ArUco markers are stored in `services/edge/assets/markers/`:
 
 Regenerate them with `bun run markers`.
 
-PPE monitoring begins when a person is tracked, even if no employee badge is visible. An unidentified person is shown as **Unidentified staff member**. The current controlled profile expects a blue mask and red gloves; hidden face or hand regions remain `Not visible` and are not reported as missing.
+PPE monitoring begins when a person is tracked, even if no employee badge is visible. An unidentified person is shown as **Unidentified staff member**. After a badge verifies one person, a same-camera identity session is remembered for 10 minutes. A new track is reassociated only when exactly one remembered session and one unassigned returning person are eligible, no employee badge is visible, and the candidate remains stable. Ambiguous scenes stay unidentified; the dashboard labels this state **Session reassociated**, and no facial recognition or body-appearance matching is used. The current controlled profile expects a blue mask and red gloves; hidden face or hand regions remain `Not visible` and are not reported as missing.
 
 ## Architecture
 
@@ -109,6 +109,14 @@ Next.js operations dashboard
 
 See [Architecture](docs/ARCHITECTURE.md) for the service interfaces, event lifecycle, security boundary, and scale-out direction.
 
+### Optional AI Operations Supervisor
+
+The edge service includes a provider-neutral, read-only AI job foundation. OpenAI is the first adapter, using `gpt-5.6-terra`, the Responses API, strict structured outputs, and `store: false`. It runs on a bounded background worker and is optional: missing credentials, internet failure, timeout, rate limits, or a provider outage do not stop local camera monitoring or evidence capture.
+
+**AI PPE Assurance** reviews only edge-selected, fresh three-frame contact sheets for visible lower-face and hand regions. Local and AI decisions remain separate; agreement is labelled only when both match, while disagreement or uncertainty becomes `Needs human review`.
+
+The **AI operations supervisor** adds seven read-only, source-grounded actions for alert, process, inventory, cold-chain, SOP, cross-operation, and shift-summary interpretation. Exact measurements and totals remain deterministic local facts; AI supplies advisory narrative only. Every action is independently release-gated and disabled until configuration, automated tests, grounded fixtures, live smoke checks, and a current readiness record pass. The **Client demo preflight** fails closed across camera, FPS, evidence, provider, rehearsal, fallback, and recovery checks. Configuration and safety details are in [AI Supervisor Setup](docs/AI_SUPERVISOR_SETUP.md).
+
 ## Common commands
 
 ```bash
@@ -121,6 +129,7 @@ bun run edge:test      # Python tests
 bun run build          # production dashboard build
 bun run test:e2e       # starts isolated services, then runs Playwright and axe
 bun run camera:soak    # 10-minute camera pipeline check
+bun run ai:verify      # fixtures plus three live grounded requests per AI action
 bun run demo:rehearse  # 8-minute system rehearsal
 bun run repo:audit     # public-source privacy, secret, and file-size checks
 ```
@@ -146,6 +155,7 @@ Private runtime data, evidence, employee photos, credentials, model weights, int
 - [Architecture](docs/ARCHITECTURE.md)
 - [Camera setup](docs/CAMERA_SETUP.md)
 - [Local demonstration runbook](docs/DEMO_RUNBOOK.md)
+- [Client demo recovery package](docs/CLIENT_DEMO_RECOVERY.md)
 - [Detection accuracy and acceptance](docs/DETECTION_ACCURACY_AND_ACCEPTANCE.md)
 - [Production requirements](docs/PRODUCTION_REQUIREMENTS_AND_ARCHITECTURE.md)
 - [Oracle integration contract](docs/ORACLE_INTEGRATION_CONTRACT.md)

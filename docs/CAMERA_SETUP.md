@@ -14,10 +14,10 @@ The local demo can change between the built-in FaceTime camera and an iPhone sup
 1. For Camo, open Camo Studio and confirm the iPhone preview is moving before the meeting. Camo Camera must appear in the macOS camera list.
 2. Start the standard local path with `bun run local`; camera analysis and the dashboard start together.
 3. Open **Live Operations** and select **Change source** in the camera command bar.
-4. Choose **FaceTime HD Camera** or **Camo Camera**. The requested camera must produce a fresh frame before the edge service commits the change.
+4. Choose any connected macOS camera. The previous capture closes briefly while the selected camera is checked for consecutive live frames.
 5. Confirm the selected source shows **Active**, camera status is **Online**, processed FPS rises above zero, and **Last frame** remains fresh.
 
-If Camo is registered but Camo Studio or the iPhone is not providing frames, the switch is rejected and FaceTime remains active. Camera indexes may change while macOS opens and releases virtual cameras; the demo tracks the stable camera label rather than assuming a permanent numeric index. Camera audio is never captured.
+If the selected camera cannot provide frames, the edge service reopens and checks the previous camera. If that source also fails, the interface reports it offline; use **Retry** on the selected source after checking its connection. Camera indexes may change while macOS opens and releases cameras, so the demo resolves the stable camera label on each open. Camera audio is never captured.
 
 ## TP-Link VIGI C340-W (4 mm)
 

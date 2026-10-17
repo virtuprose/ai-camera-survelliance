@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BellRing, Boxes, ChartNoAxesCombined, ClipboardCheck, Gauge, Menu, Radio, ShieldCheck, SlidersHorizontal, Thermometer, UsersRound } from "lucide-react";
+import { BellRing, Bot, Boxes, ChartNoAxesCombined, ClipboardCheck, Gauge, ListChecks, Menu, Radio, ShieldCheck, SlidersHorizontal, Thermometer, UsersRound } from "lucide-react";
 import { AlertSoundControl } from "@/components/alert-sound-control";
 import { AlertSoundProvider } from "@/components/alert-sound-provider";
 import { BrandLockup } from "@/components/brand-lockup";
@@ -29,6 +29,8 @@ const navigation = [
   { group: "Operations", href: "/inventory", label: "Inventory", short: "Inventory", icon: Boxes, roles: ["operations"] },
   { group: "Assurance", href: "/incidents", label: "Incidents & evidence", short: "Incidents", icon: BellRing, roles: ["executive", "qa_supervisor", "operations"] },
   { group: "Assurance", href: "/reports", label: "Reports & audit", short: "Reports", icon: ChartNoAxesCombined, roles: ["executive", "qa_supervisor"] },
+  { group: "Intelligence", href: "/ai-supervisor", label: "AI supervisor", short: "AI supervisor", icon: Bot, roles: ["executive", "qa_supervisor", "operations", "it"] },
+  { group: "Administration", href: "/preflight", label: "Demo preflight", short: "Preflight", icon: ListChecks, roles: ["qa_supervisor", "it"] },
   { group: "Administration", href: "/platform", label: "Platform", short: "Platform", icon: SlidersHorizontal, roles: ["it"] },
 ] as const;
 

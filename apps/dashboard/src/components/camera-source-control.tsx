@@ -26,11 +26,12 @@ function SourceIcon({ option }: { option: CameraOption }) {
 interface CameraSourceControlProps {
   activeId: string;
   currentLabel: string;
+  cameraOnline: boolean;
   disabled?: boolean;
   onSwitched: () => Promise<void> | void;
 }
 
-export function CameraSourceControl({ activeId, currentLabel, disabled, onSwitched }: CameraSourceControlProps) {
+export function CameraSourceControl({ activeId, currentLabel, cameraOnline, disabled, onSwitched }: CameraSourceControlProps) {
   const [open, setOpen] = useState(false);
   const [catalog, setCatalog] = useState<CameraCatalog | null>(null);
   const [loading, setLoading] = useState(false);
@@ -56,9 +57,9 @@ export function CameraSourceControl({ activeId, currentLabel, disabled, onSwitch
   }
 
   async function switchTo(option: CameraOption) {
-    if (option.active || !option.registered || switchingId) return;
+    if ((option.active && cameraOnline) || !option.registered || switchingId) return;
     setSwitchingId(option.id);
-    setMessage(`Checking ${option.label} for a fresh frame…`);
+    setMessage(`${option.active ? "Retrying" : "Checking"} ${option.label} for live frames…`);
     try {
       const next = await selectCamera(option.id);
       setCatalog(next);
@@ -69,7 +70,7 @@ export function CameraSourceControl({ activeId, currentLabel, disabled, onSwitch
       });
     } catch (reason) {
       const detail = reason instanceof Error ? reason.message : "Camera switch failed.";
-      toast.error("Camera source unchanged", { description: detail });
+      toast.error("Camera unavailable", { description: detail });
       await load();
       setMessage(detail);
     } finally {
@@ -112,14 +113,16 @@ export function CameraSourceControl({ activeId, currentLabel, disabled, onSwitch
           ) : catalog?.options.map((option) => {
             const isActive = option.id === (catalog.activeId || activeId);
             const isSwitching = switchingId === option.id;
+            const canRetry = isActive && !cameraOnline;
             return (
               <button
                 type="button"
-                className={`camera-source-option${isActive ? " is-active" : ""}`}
+                className={`camera-source-option${isActive ? " is-active" : ""}${canRetry ? " is-offline" : ""}`}
                 key={option.id}
                 onClick={() => void switchTo(option)}
-                disabled={isActive || !option.registered || Boolean(switchingId)}
+                disabled={(isActive && !canRetry) || !option.registered || Boolean(switchingId)}
                 aria-current={isActive ? "true" : undefined}
+                aria-label={canRetry ? `Retry ${option.label}` : undefined}
               >
                 <span className="camera-source-icon"><SourceIcon option={option} /></span>
                 <span className="camera-source-copy">
@@ -127,7 +130,7 @@ export function CameraSourceControl({ activeId, currentLabel, disabled, onSwitch
                   <small>{option.description}</small>
                 </span>
                 <span className={`camera-source-state${!option.registered ? " is-unavailable" : ""}`}>
-                  {isSwitching ? <><LoaderCircle className="spin" />Switching</> : isActive ? <><Check />Active</> : option.registered ? "Available" : "Unavailable"}
+                  {isSwitching ? <><LoaderCircle className="spin" />Checking</> : canRetry ? <><RefreshCw />Retry</> : isActive ? <><Check />Active</> : option.registered ? "Available" : "Unavailable"}
                 </span>
               </button>
             );
@@ -137,7 +140,7 @@ export function CameraSourceControl({ activeId, currentLabel, disabled, onSwitch
         {message && <p className="camera-source-message" role="status">{message}</p>}
         <div className="camera-source-note">
           <VideoOff aria-hidden="true" />
-          <span>A new source must provide a fresh frame before it replaces the current feed. Camera audio remains disabled.</span>
+          <span>Camera switching briefly pauses the feed while live frames are checked. Camera audio remains disabled.</span>
         </div>
         <div className="camera-source-note camera-source-help">
           <Monitor aria-hidden="true" />

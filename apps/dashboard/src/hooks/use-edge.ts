@@ -2,7 +2,7 @@
 
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { fallbackState, seedEvents } from "@/lib/demo-state";
-import type { CameraCatalog, DemoEvent, DetectionState, EventStatus, LiveState } from "@/lib/types";
+import type { AIFeatureCatalog, AIOperationsAction, AIJob, CameraCatalog, ClientDemoPreflight, DemoEvent, DetectionState, EventStatus, LiveState } from "@/lib/types";
 import { getSupabaseBrowserClient, isSupabaseConfigured } from "@/lib/supabase/client";
 
 const STATE_POLL_MS = 1_000;
@@ -85,7 +85,8 @@ export function OperationsDataProvider({ children }: { children: React.ReactNode
 
   const refreshState = useCallback(async () => {
     try {
-      setState(await request<LiveState>("/api/state"));
+      const next = await request<LiveState>("/api/state");
+      setState({ ...next, identitySessions: next.identitySessions ?? [] });
       setStateConnected(true);
       setStateError(null);
     } catch (reason) {
@@ -190,4 +191,35 @@ export async function selectCamera(cameraId: string) {
 
 export async function resetDetection() {
   return request<{ ok: true; detection: DetectionState }>("/api/detection/reset", { method: "POST" });
+}
+
+export async function clearIdentitySessions() {
+  return request<{ ok: true; clearedSessions: number; retainedEventsDeleted: 0 }>("/api/identity/sessions/clear", { method: "POST" });
+}
+
+export async function requestPpeReview() {
+  return request<AIJob>("/api/ai/ppe/review", { method: "POST" });
+}
+
+export async function getAIJob(jobId: string) {
+  return request<AIJob>(`/api/ai/jobs/${jobId}`);
+}
+
+export async function getAIFeatures() {
+  return request<AIFeatureCatalog>("/api/ai/features");
+}
+
+export async function runAIOperation(action: AIOperationsAction) {
+  return request<AIJob>(`/api/ai/actions/${action}`, { method: "POST" });
+}
+
+export async function setAIFeatureEnabled(action: AIOperationsAction, enabled: boolean) {
+  return request<AIFeatureCatalog["items"][number]>(`/api/ai/features/${action}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export async function getClientDemoPreflight() {
+  return request<ClientDemoPreflight>("/api/preflight");
 }

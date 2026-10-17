@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from .pipeline import CameraSwitchError, EdgePipeline
+from .ppe_review import PPEReviewUnavailable
 from .settings import Settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -68,6 +72,66 @@ class CameraSwitchRequest(BaseModel):
     cameraId: str
 
 
+class AIFeatureToggleRequest(BaseModel):
+    enabled: bool
+
+
+class ReadinessRecordRequest(BaseModel):
+    status: str
+    evidence: str = Field(min_length=3, max_length=500)
+
+
+def _validate_ai_value(value: Any, *, depth: int = 0) -> None:
+    if depth > 4:
+        raise ValueError("AI facts exceed the maximum nesting depth")
+    if value is None or isinstance(value, str | int | float | bool):
+        if isinstance(value, str) and len(value) > 2000:
+            raise ValueError("AI fact strings must not exceed 2000 characters")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("AI numeric facts must be finite")
+        return
+    if isinstance(value, list):
+        if len(value) > 50:
+            raise ValueError("AI fact lists must not exceed 50 items")
+        for item in value:
+            _validate_ai_value(item, depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        if len(value) > 50:
+            raise ValueError("AI fact objects must not exceed 50 fields")
+        for key, item in value.items():
+            if not isinstance(key, str) or len(key) > 100:
+                raise ValueError("AI fact keys must be short strings")
+            blocked_fields = ("api_key", "secret", "token", "image", "crop", "frame")
+            if any(blocked in key.lower() for blocked in blocked_fields):
+                raise ValueError("Images and secrets are not accepted by the Phase 2 job endpoint")
+            _validate_ai_value(item, depth=depth + 1)
+        return
+    raise ValueError("AI facts must contain JSON-compatible values only")
+
+
+class AIJobRequest(BaseModel):
+    action: str = Field(min_length=1, max_length=64)
+    sourceRecordIds: list[str] = Field(default_factory=list, max_length=20)
+    facts: dict[str, Any] = Field(default_factory=dict)
+    dedupeKey: str | None = Field(default=None, max_length=128)
+
+    @field_validator("sourceRecordIds")
+    @classmethod
+    def validate_source_record_ids(cls, value: list[str]) -> list[str]:
+        if any(not item or len(item) > 128 for item in value):
+            raise ValueError("Source record IDs must contain 1 to 128 characters")
+        return list(dict.fromkeys(value))
+
+    @field_validator("facts")
+    @classmethod
+    def validate_facts(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _validate_ai_value(value)
+        if len(json.dumps(value, separators=(",", ":")).encode()) > 16_384:
+            raise ValueError("AI facts must not exceed 16 KB")
+        return value
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     state = pipeline.state()
@@ -77,6 +141,80 @@ def health() -> dict[str, object]:
 @app.get("/api/state", dependencies=[Depends(authorize)])
 def state() -> dict[str, object]:
     return pipeline.state()
+
+
+@app.get("/api/ai/status", dependencies=[Depends(authorize)])
+def ai_status() -> dict[str, object]:
+    return pipeline.ai.status()
+
+
+@app.post("/api/ai/jobs", status_code=202, dependencies=[Depends(authorize)])
+def create_ai_job(request: AIJobRequest) -> dict[str, object]:
+    try:
+        return pipeline.ai.create_job(
+            action=request.action,
+            source_record_ids=request.sourceRecordIds,
+            facts=request.facts,
+            dedupe_key=request.dedupeKey,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/api/ai/jobs/{job_id}", dependencies=[Depends(authorize)])
+def get_ai_job(job_id: str) -> dict[str, object]:
+    try:
+        return pipeline.store.get_ai_job(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="AI job not found") from error
+
+
+@app.post("/api/ai/ppe/review", status_code=202, dependencies=[Depends(authorize)])
+def create_ppe_review() -> dict[str, object]:
+    try:
+        return pipeline.request_ppe_review()
+    except PPEReviewUnavailable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/api/ai/features", dependencies=[Depends(authorize)])
+def ai_features() -> dict[str, object]:
+    return pipeline.ai_feature_readiness()
+
+
+@app.patch("/api/ai/features/{action}", dependencies=[Depends(authorize)])
+def toggle_ai_feature(action: str, request: AIFeatureToggleRequest) -> dict[str, object]:
+    try:
+        return pipeline.operations_supervisor.set_enabled(action, request.enabled)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="AI action not found") from error
+
+
+@app.post("/api/ai/actions/{action}", status_code=202, dependencies=[Depends(authorize)])
+def run_ai_action(action: str) -> dict[str, object]:
+    try:
+        return pipeline.run_ai_operation(action)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="AI action not found") from error
+    except PermissionError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.get("/api/preflight", dependencies=[Depends(authorize)])
+def client_demo_preflight() -> dict[str, object]:
+    return pipeline.client_demo_preflight()
+
+
+@app.patch("/api/preflight/checks/{check_id}", dependencies=[Depends(authorize)])
+def record_preflight_check(check_id: str, request: ReadinessRecordRequest) -> dict[str, object]:
+    try:
+        return pipeline.client_preflight.record_manual(check_id, request.status, request.evidence)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Preflight check not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.get("/api/cameras", dependencies=[Depends(authorize)])
@@ -100,6 +238,11 @@ def events() -> dict[str, object]:
 @app.post("/api/detection/reset", dependencies=[Depends(authorize)])
 def reset_detection() -> dict[str, object]:
     return {"ok": True, "detection": pipeline.reset_detection()}
+
+
+@app.post("/api/identity/sessions/clear", dependencies=[Depends(authorize)])
+def clear_identity_sessions() -> dict[str, object]:
+    return {"ok": True, **pipeline.clear_identity_sessions()}
 
 
 @app.get("/api/temperature", dependencies=[Depends(authorize)])

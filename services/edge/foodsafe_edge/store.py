@@ -41,6 +41,10 @@ class EventStore:
     def __init__(self, database_path: Path):
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # AI request facts are held only for the lifetime of a queued job. They
+        # are never written to SQLite; durable records retain provenance and
+        # the structured result only.
+        self._ai_job_requests: dict[str, dict[str, Any]] = {}
         self.connection = sqlite3.connect(database_path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
@@ -120,6 +124,49 @@ class EventStore:
                 CREATE TABLE IF NOT EXISTS runtime_health (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     checked_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ai_jobs (
+                    id TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('queued','analyzing','completed','needs_review','unavailable','failed')
+                    ),
+                    source_record_ids_json TEXT NOT NULL DEFAULT '[]',
+                    model TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    result_json TEXT,
+                    provider_request_id TEXT,
+                    latency_ms INTEGER,
+                    failure_code TEXT,
+                    failure_detail TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    retention_until TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_jobs_created_at ON ai_jobs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ai_jobs_fingerprint ON ai_jobs(request_fingerprint);
+                CREATE TABLE IF NOT EXISTS ai_feature_readiness (
+                    action TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    config_passed INTEGER NOT NULL DEFAULT 0,
+                    automated_tests_passed INTEGER NOT NULL DEFAULT 0,
+                    fixtures_passed INTEGER NOT NULL DEFAULT 0,
+                    live_smoke_passed INTEGER NOT NULL DEFAULT 0,
+                    detail TEXT NOT NULL DEFAULT '',
+                    checked_at TEXT,
+                    expires_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS demo_readiness (
+                    check_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK (status IN ('passed','pending','failed')),
+                    evidence TEXT NOT NULL DEFAULT '',
+                    checked_at TEXT,
+                    expires_at TEXT,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -221,6 +268,25 @@ class EventStore:
                 (json.dumps(metadata, separators=(",", ":")), iso(), event_id),
             )
 
+    def append_ai_review_reference(self, event_id: str, job_id: str) -> bool:
+        """Link an advisory review without changing the event or its evidence."""
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                "SELECT metadata_json FROM events WHERE id=?", (event_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            metadata = json.loads(row["metadata_json"] or "{}")
+            references = list(metadata.get("ai_review_job_ids") or [])
+            if job_id not in references:
+                references.append(job_id)
+            metadata["ai_review_job_ids"] = references
+            self.connection.execute(
+                "UPDATE events SET metadata_json=?,sync_status='pending',updated_at=? WHERE id=?",
+                (json.dumps(metadata, separators=(",", ":")), iso(), event_id),
+            )
+        return True
+
     def pending_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connection.execute(
@@ -255,6 +321,298 @@ class EventStore:
             ).fetchone()
         if row is None or row["checked_at"] != checked_at:
             raise RuntimeError("Local event ledger health check failed")
+
+    def create_ai_job(
+        self,
+        *,
+        action: str,
+        source_record_ids: list[str],
+        model: str,
+        prompt_version: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any]:
+        job_id = str(uuid.uuid4())
+        created_at = iso()
+        retention_until = iso(utc_now() + timedelta(days=365))
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO ai_jobs(
+                    id,action,status,source_record_ids_json,model,prompt_version,
+                    request_fingerprint,created_at,retention_until,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    job_id,
+                    action,
+                    "queued",
+                    json.dumps(source_record_ids, separators=(",", ":")),
+                    model,
+                    prompt_version,
+                    request_fingerprint,
+                    created_at,
+                    retention_until,
+                    created_at,
+                ),
+            )
+        return self.get_ai_job(job_id)
+
+    def set_ai_job_request(self, job_id: str, facts: dict[str, Any]) -> None:
+        with self._lock:
+            self._ai_job_requests[job_id] = facts
+
+    def take_ai_job_request(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._ai_job_requests.pop(job_id, {})
+
+    def discard_ai_job_request(self, job_id: str) -> None:
+        with self._lock:
+            self._ai_job_requests.pop(job_id, None)
+
+    def start_ai_job(self, job_id: str) -> dict[str, Any]:
+        started_at = iso()
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE ai_jobs SET status='analyzing',started_at=?,updated_at=? "
+                "WHERE id=? AND status='queued'",
+                (started_at, started_at, job_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(job_id)
+        return self.get_ai_job(job_id)
+
+    def finish_ai_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        latency_ms: int | None = None,
+        provider_request_id: str | None = None,
+        failure_code: str | None = None,
+        failure_detail: str | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"completed", "needs_review", "unavailable", "failed"}:
+            raise ValueError("Unsupported AI job terminal status")
+        completed_at = iso()
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE ai_jobs SET status=?,result_json=?,provider_request_id=?,latency_ms=?,
+                    failure_code=?,failure_detail=?,completed_at=?,updated_at=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    json.dumps(result, separators=(",", ":")) if result is not None else None,
+                    provider_request_id,
+                    latency_ms,
+                    failure_code,
+                    failure_detail,
+                    completed_at,
+                    completed_at,
+                    job_id,
+                ),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(job_id)
+        self.discard_ai_job_request(job_id)
+        return self.get_ai_job(job_id)
+
+    def get_ai_job(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self.connection.execute("SELECT * FROM ai_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return self._row_to_ai_job(row)
+
+    def find_recent_ai_job(self, request_fingerprint: str, seconds: int) -> dict[str, Any] | None:
+        threshold = iso(utc_now() - timedelta(seconds=seconds))
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT * FROM ai_jobs
+                WHERE request_fingerprint=? AND created_at>=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (request_fingerprint, threshold),
+            ).fetchone()
+        return self._row_to_ai_job(row) if row is not None else None
+
+    def list_ai_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM ai_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._row_to_ai_job(row) for row in rows]
+
+    def latest_successful_ai_job_at(self) -> str | None:
+        """Return the newest durable provider success across edge restarts."""
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT completed_at FROM ai_jobs
+                WHERE status IN ('completed','needs_review') AND completed_at IS NOT NULL
+                ORDER BY completed_at DESC LIMIT 1
+                """
+            ).fetchone()
+        return str(row["completed_at"]) if row is not None else None
+
+    def recover_incomplete_ai_jobs(self) -> int:
+        """Close jobs interrupted by a previous edge-process shutdown."""
+        completed_at = iso()
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE ai_jobs SET status='unavailable',failure_code='worker_restarted',
+                    failure_detail='The previous AI worker stopped before this job completed.',
+                    completed_at=?,updated_at=?
+                WHERE status IN ('queued','analyzing')
+                """,
+                (completed_at, completed_at),
+            )
+            self._ai_job_requests.clear()
+        return cursor.rowcount
+
+    def ensure_ai_features(self, actions: list[str]) -> None:
+        now = iso()
+        with self._lock, self.connection:
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO ai_feature_readiness(action,updated_at) VALUES(?,?)",
+                [(action, now) for action in actions],
+            )
+
+    def list_ai_feature_readiness(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM ai_feature_readiness ORDER BY action"
+            ).fetchall()
+        now = utc_now()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            expires_at = row["expires_at"]
+            current = bool(
+                expires_at
+                and datetime.fromisoformat(expires_at.replace("Z", "+00:00")) > now
+            )
+            gates = {
+                "configuration": bool(row["config_passed"]),
+                "automatedTests": bool(row["automated_tests_passed"]),
+                "groundedFixtures": bool(row["fixtures_passed"]),
+                "liveSmoke": bool(row["live_smoke_passed"]),
+            }
+            enabled = bool(row["enabled"])
+            result.append(
+                {
+                    "action": row["action"],
+                    "enabled": enabled,
+                    "gates": gates,
+                    "checkedAt": row["checked_at"],
+                    "expiresAt": expires_at,
+                    "current": current,
+                    "ready": enabled and current and all(gates.values()),
+                    "detail": row["detail"],
+                }
+            )
+        return result
+
+    def set_ai_feature_enabled(self, action: str, enabled: bool) -> dict[str, Any]:
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE ai_feature_readiness SET enabled=?,updated_at=? WHERE action=?",
+                (int(enabled), iso(), action),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(action)
+        return next(item for item in self.list_ai_feature_readiness() if item["action"] == action)
+
+    def record_ai_feature_readiness(
+        self,
+        action: str,
+        *,
+        config_passed: bool,
+        automated_tests_passed: bool,
+        fixtures_passed: bool,
+        live_smoke_passed: bool,
+        detail: str,
+        valid_for_hours: int = 24,
+    ) -> dict[str, Any]:
+        checked_at = utc_now()
+        expires_at = checked_at + timedelta(hours=max(1, valid_for_hours))
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE ai_feature_readiness SET config_passed=?,automated_tests_passed=?,
+                    fixtures_passed=?,live_smoke_passed=?,detail=?,checked_at=?,expires_at=?,updated_at=?
+                WHERE action=?
+                """,
+                (
+                    int(config_passed),
+                    int(automated_tests_passed),
+                    int(fixtures_passed),
+                    int(live_smoke_passed),
+                    detail,
+                    iso(checked_at),
+                    iso(expires_at),
+                    iso(),
+                    action,
+                ),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(action)
+        return next(item for item in self.list_ai_feature_readiness() if item["action"] == action)
+
+    def record_demo_readiness(
+        self,
+        check_id: str,
+        status: str,
+        evidence: str,
+        *,
+        valid_for_hours: int = 24,
+    ) -> dict[str, Any]:
+        if status not in {"passed", "pending", "failed"}:
+            raise ValueError("Unsupported readiness status")
+        checked_at = utc_now()
+        expires_at = checked_at + timedelta(hours=max(1, valid_for_hours))
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO demo_readiness(check_id,status,evidence,checked_at,expires_at,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(check_id) DO UPDATE SET status=excluded.status,evidence=excluded.evidence,
+                    checked_at=excluded.checked_at,expires_at=excluded.expires_at,updated_at=excluded.updated_at
+                """,
+                (check_id, status, evidence, iso(checked_at), iso(expires_at), iso()),
+            )
+        return self.get_demo_readiness(check_id)
+
+    def get_demo_readiness(self, check_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM demo_readiness WHERE check_id=?", (check_id,)
+            ).fetchone()
+        if row is None:
+            return {
+                "checkId": check_id,
+                "status": "pending",
+                "evidence": "Verification has not been recorded.",
+                "checkedAt": None,
+                "expiresAt": None,
+                "current": False,
+            }
+        current = bool(
+            row["expires_at"]
+            and datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00")) > utc_now()
+        )
+        status = row["status"] if current else "pending"
+        return {
+            "checkId": row["check_id"],
+            "status": status,
+            "evidence": row["evidence"] if current else "Previous verification expired; rerun it.",
+            "checkedAt": row["checked_at"],
+            "expiresAt": row["expires_at"],
+            "current": current,
+        }
 
     def inventory(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -436,4 +794,27 @@ class EventStore:
             "evidenceUrl": row["evidence_url"],
             "retentionUntil": row["retention_until"],
             "metadata": json.loads(row["metadata_json"]),
+        }
+
+    @staticmethod
+    def _row_to_ai_job(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "action": row["action"],
+            "status": row["status"],
+            "sourceRecordIds": json.loads(row["source_record_ids_json"]),
+            "model": row["model"],
+            "promptVersion": row["prompt_version"],
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "providerRequestId": row["provider_request_id"],
+            "latencyMs": row["latency_ms"],
+            "failure": (
+                {"code": row["failure_code"], "detail": row["failure_detail"]}
+                if row["failure_code"]
+                else None
+            ),
+            "createdAt": row["created_at"],
+            "startedAt": row["started_at"],
+            "completedAt": row["completed_at"],
+            "retentionUntil": row["retention_until"],
         }

@@ -18,6 +18,7 @@
     "camera:soak": "cd services/edge && uv run python scripts/pipeline_soak.py --minutes 10",
     "camera:raw-soak": "cd services/edge && uv run python scripts/camera_soak.py --minutes 10",
     "ppe:acceptance": "cd services/edge && uv run python scripts/ppe_acceptance.py",
+    "ai:verify": "cd services/edge && uv run python scripts/verify_ai_operations.py --live-runs 3",
     "demo:rehearse": "cd services/edge && uv run python scripts/rehearse_demo.py --minutes 8",
     "build": "bun run --cwd apps/dashboard build",
     "lint": "bun run --cwd apps/dashboard lint",

@@ -10,12 +10,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .ai_supervisor import AIJobWorker
 from .camera import OpenCVCameraSource, camera_catalog, camera_id_for_settings
 from .detector import PersonDetection, PersonDetector, create_detector
 from .enterprise import EnterpriseStore
 from .evidence import EvidenceBuffer
 from .livekit_publisher import LiveKitPublisher
 from .markers import EMPLOYEE_MARKERS, INVENTORY_MARKERS, TRAY_MARKERS, ArucoMarkerReader, Marker
+from .operations_supervisor import ClientDemoPreflight, OperationsSupervisor
 from .ppe import (
     ITEM_ORDER,
     REQUIRED_ITEMS,
@@ -24,6 +26,7 @@ from .ppe import (
     PPEResult,
     PPEStabilizer,
 )
+from .ppe_review import PPEReviewBuffer, PPEReviewUnavailable
 from .settings import Settings
 from .store import EventInput, EventStore, iso
 from .sync import CloudSyncWorker
@@ -108,6 +111,18 @@ class EdgePipeline:
         self.settings = settings
         self.store = EventStore(settings.database_path)
         self.enterprise = EnterpriseStore(self.store)
+        self.ai = AIJobWorker(settings, self.store)
+        self.operations_supervisor = OperationsSupervisor(
+            settings, self.store, self.enterprise, self.ai
+        )
+        self.client_preflight = ClientDemoPreflight(
+            settings, self.store, self.operations_supervisor
+        )
+        self.ppe_review = PPEReviewBuffer(
+            minimum_observations=settings.ai_ppe_min_observations,
+            maximum_age_seconds=settings.ai_ppe_observation_max_age_seconds,
+            minimum_visibility_confidence=settings.ai_ppe_min_visibility_confidence,
+        )
         self.camera = OpenCVCameraSource(settings)
         self.detector: PersonDetector | None = None
         self.marker_reader = ArucoMarkerReader()
@@ -174,6 +189,9 @@ class EdgePipeline:
         self.track_employee_binding_seen: dict[int, float] = {}
         self.track_employee_binding_verified_at: dict[int, str] = {}
         self.track_employee_binding_confidence: dict[int, float] = {}
+        self.track_identity_association: dict[int, str] = {}
+        self.identity_sessions: dict[str, dict[str, Any]] = {}
+        self.identity_reentry_candidates: dict[int, tuple[str, float]] = {}
         self.track_paths: dict[int, deque[tuple[int, int]]] = {}
         self.movement_zone: dict[str, str] = {}
         self.movement_candidate: dict[str, tuple[str, float]] = {}
@@ -182,8 +200,11 @@ class EdgePipeline:
         self.identity_alerted: set[int] = set()
         self.ppe_missing_since: dict[tuple[str, str], float] = {}
         self.ppe_alerted: set[tuple[str, str]] = set()
+        self.ppe_alert_event_by_track_item: dict[tuple[int, str], str] = {}
         self.ppe_recovery_since: dict[tuple[str, str], float] = {}
         self.ppe_observed_at: dict[tuple[str, str], float] = {}
+        self.latest_ppe_review_job_id: str | None = None
+        self._last_ai_review_signature: dict[int, tuple[tuple[str, str], ...]] = {}
         self.process_state: dict[str, Any] = {
             "id": None,
             "label": "Chicken Washing",
@@ -236,6 +257,7 @@ class EdgePipeline:
         self.temperature_source.start()
         self.sync.start()
         self.livekit.start()
+        self.ai.start()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -246,6 +268,7 @@ class EdgePipeline:
         self.temperature_source.stop()
         self.sync.stop()
         self.livekit.stop()
+        self.ai.stop()
 
     def cameras(self) -> dict[str, Any]:
         catalog = camera_catalog(self.settings)
@@ -257,10 +280,21 @@ class EdgePipeline:
         )
         return catalog
 
+    @staticmethod
+    def _camera_has_fresh_frames(camera: OpenCVCameraSource) -> bool:
+        consecutive = 0
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            ok, frame = camera.read()
+            consecutive = consecutive + 1 if ok and frame is not None else 0
+            if consecutive >= 2:
+                return True
+            time.sleep(0.1)
+        return False
+
     def switch_camera(self, camera_id: str) -> dict[str, Any]:
         if not self.camera_switch_lock.acquire(blocking=False):
             raise CameraSwitchError("Another camera switch is already in progress.")
-        candidate: OpenCVCameraSource | None = None
         try:
             self.camera_switch_state = "switching"
             self.camera_switch_message = "Checking the requested camera for fresh frames."
@@ -268,7 +302,7 @@ class EdgePipeline:
             option = next((item for item in catalog["options"] if item["id"] == camera_id), None)
             if not option:
                 raise CameraSwitchError("The requested camera is not configured for this demo.")
-            if option["active"]:
+            if option["active"] and self.camera_online:
                 self.camera_switch_state = "idle"
                 self.camera_switch_message = f"{option['label']} is already active."
                 return self.cameras()
@@ -277,6 +311,8 @@ class EdgePipeline:
                     f"{option['label']} is not available. Open its camera software or reconnect the device."
                 )
 
+            # AVFoundation can fail to deliver frames when two cameras are open
+            # in this process. Release the old capture before testing the new one.
             candidate_settings = self.settings.model_copy(
                 update={
                     "camera_kind": option["kind"],
@@ -284,43 +320,70 @@ class EdgePipeline:
                     "camera_label": option["label"],
                 }
             )
-            candidate = OpenCVCameraSource(candidate_settings)
-            if not candidate.open():
-                raise CameraSwitchError(
-                    f"{option['label']} could not be opened. The current camera remains active."
-                )
-            frame_ok = False
-            deadline = time.monotonic() + 4
-            while time.monotonic() < deadline:
-                ok, frame = candidate.read()
-                if ok and frame is not None:
-                    frame_ok = True
-                    break
-                time.sleep(0.1)
-            if not frame_ok:
-                raise CameraSwitchError(
-                    f"{option['label']} did not provide a fresh frame. The current camera remains active."
-                )
-
             with self.camera_lock:
-                previous = self.camera
+                previous_settings = self.settings.model_copy()
+                self.camera.close()
+                self.camera_online = False
+                with self.frame_condition:
+                    self.latest_jpeg = None
+                    self.latest_bgr = None
+                    self.last_frame_at = None
+                    self.processed_fps = 0.0
+                    self.frame_condition.notify_all()
+
+                candidate = OpenCVCameraSource(candidate_settings)
+                try:
+                    if not candidate.open():
+                        raise CameraSwitchError(f"{option['label']} could not be opened.")
+                    if not self._camera_has_fresh_frames(candidate):
+                        raise CameraSwitchError(f"{option['label']} did not provide fresh frames.")
+                except Exception as error:
+                    candidate.close()
+                    restored = OpenCVCameraSource(previous_settings)
+                    try:
+                        previous_ready = restored.open() and self._camera_has_fresh_frames(restored)
+                    except Exception:
+                        logger.exception("Previous camera could not be restored")
+                        previous_ready = False
+                    self.camera = restored
+                    self.camera_online = previous_ready
+                    self.settings.camera_source = previous_settings.camera_source
+                    self.settings.camera_label = previous_settings.camera_label
+                    if not previous_ready:
+                        restored.close()
+                    reason = (
+                        str(error)
+                        if isinstance(error, CameraSwitchError)
+                        else "The selected camera failed."
+                    )
+                    recovery = (
+                        f"{previous_settings.camera_label} was restored."
+                        if previous_ready
+                        else (
+                            f"{previous_settings.camera_label} also has no live frames. "
+                            "Check its connection and retry."
+                        )
+                    )
+                    raise CameraSwitchError(f"{reason} {recovery}") from error
+
                 self.camera = candidate
-                self.settings.camera_kind = str(option["kind"])
-                self.settings.camera_source = str(option["source"])
-                self.settings.camera_label = str(option["label"])
-                candidate = None
-                previous.close()
+                self.settings.camera_kind = candidate_settings.camera_kind
+                self.settings.camera_source = candidate_settings.camera_source
+                self.settings.camera_label = candidate_settings.camera_label
             with self.frame_condition:
-                self.latest_jpeg = None
-                self.latest_bgr = None
-                self.last_frame_at = None
-                self.processed_fps = 0.0
                 self._fps_frames = 0
                 self._fps_started = time.monotonic()
                 self.active_employee = None
                 self.active_subject_last_seen = 0.0
                 self.track_first_seen.clear()
                 self.track_last_seen.clear()
+                self.track_employee_binding.clear()
+                self.track_employee_binding_seen.clear()
+                self.track_employee_binding_verified_at.clear()
+                self.track_employee_binding_confidence.clear()
+                self.track_identity_association.clear()
+                self.identity_sessions.clear()
+                self.identity_reentry_candidates.clear()
                 self.track_paths.clear()
                 self.movement_zone.clear()
                 self.movement_candidate.clear()
@@ -330,8 +393,12 @@ class EdgePipeline:
                 self.ppe_stabilizer.reset()
                 self.ppe_missing_since.clear()
                 self.ppe_alerted.clear()
+                self.ppe_alert_event_by_track_item.clear()
                 self.ppe_recovery_since.clear()
                 self.ppe_observed_at.clear()
+                self.ppe_review.clear()
+                self.latest_ppe_review_job_id = None
+                self._last_ai_review_signature.clear()
                 self.camera_online = True
                 self.frame_condition.notify_all()
             self.camera_switch_state = "idle"
@@ -349,8 +416,6 @@ class EdgePipeline:
             )
             raise CameraSwitchError(self.camera_switch_message) from error
         finally:
-            if candidate is not None:
-                candidate.close()
             self.camera_switch_lock.release()
 
     def _run(self) -> None:
@@ -433,25 +498,105 @@ class EdgePipeline:
             assigned_markers.add(marker_index)
         return assignments
 
+    def _prune_identity_sessions(self, observed_at: float) -> None:
+        expired = [
+            employee_id
+            for employee_id, session in self.identity_sessions.items()
+            if observed_at - float(session["lastSeenMonotonic"])
+            > self.settings.identity_reentry_seconds
+        ]
+        for employee_id in expired:
+            self.identity_sessions.pop(employee_id, None)
+        if expired:
+            expired_ids = set(expired)
+            for track_id, (employee_id, _started_at) in list(
+                self.identity_reentry_candidates.items()
+            ):
+                if employee_id in expired_ids:
+                    self.identity_reentry_candidates.pop(track_id, None)
+
+    def _reentry_assignments(
+        self,
+        people: list[PersonDetection],
+        employee_markers: list[Marker],
+        marker_by_track: dict[int, Marker],
+        observed_at: float,
+    ) -> dict[int, dict[str, Any]]:
+        """Return one conservative non-biometric session-to-track reassociation."""
+        self._prune_identity_sessions(observed_at)
+        unassigned = [
+            person
+            for person in people
+            if person.track_id not in marker_by_track
+            and person.track_id not in self.track_employee_binding
+        ]
+        if employee_markers or len(unassigned) != 1:
+            self.identity_reentry_candidates.clear()
+            return {}
+
+        visible_track_ids = {person.track_id for person in people}
+        visible_employee_ids = {
+            employee["employeeId"]
+            for track_id, employee in self.track_employee_binding.items()
+            if track_id in visible_track_ids
+        }
+        camera_id = camera_id_for_settings(self.settings)
+        eligible = [
+            session
+            for employee_id, session in self.identity_sessions.items()
+            if employee_id not in visible_employee_ids
+            and session["cameraId"] == camera_id
+            and observed_at - float(session["lastSeenMonotonic"])
+            <= self.settings.identity_reentry_seconds
+        ]
+        if len(eligible) != 1:
+            self.identity_reentry_candidates.clear()
+            return {}
+
+        person = unassigned[0]
+        session = eligible[0]
+        employee_id = str(session["employee"]["employeeId"])
+        candidate = self.identity_reentry_candidates.get(person.track_id)
+        if candidate is None or candidate[0] != employee_id:
+            self.identity_reentry_candidates = {
+                person.track_id: (employee_id, observed_at)
+            }
+            return {}
+        self.identity_reentry_candidates = {person.track_id: candidate}
+        if observed_at - candidate[1] < self.settings.identity_reentry_stability_seconds:
+            return {}
+        self.identity_reentry_candidates.pop(person.track_id, None)
+        return {person.track_id: session}
+
     def _process(self, frame: np.ndarray) -> np.ndarray:
         height, width = frame.shape[:2]
         people = self.detector.detect(frame) if self.detector else []
         markers = self.marker_reader.read(frame)
         employee_markers = [marker for marker in markers if marker.marker_id in EMPLOYEE_MARKERS]
+        review_frame = frame.copy()
         draw_zones(frame)
         self._handle_process_and_inventory(markers, frame)
         employee_marker_by_track = self._assign_employee_markers(people, employee_markers)
 
-        resolved_employee = False
-        resolved_subject = False
+        observed_at = time.monotonic()
         for person in people:
-            observed_at = time.monotonic()
             previous_track_seen = self.track_last_seen.get(person.track_id)
             if (
                 previous_track_seen is not None
                 and observed_at - previous_track_seen > self.settings.identity_binding_seconds
             ):
                 self._clear_track_identity(person.track_id)
+        reentry_by_track = self._reentry_assignments(
+            people,
+            employee_markers,
+            employee_marker_by_track,
+            observed_at,
+        )
+
+        resolved_employee = False
+        resolved_subject = False
+        for person in people:
+            reassociation_event_id: str | None = None
             self.track_first_seen.setdefault(person.track_id, iso())
             self.track_last_seen[person.track_id] = observed_at
             matched = employee_marker_by_track.get(person.track_id)
@@ -459,6 +604,8 @@ class EdgePipeline:
                 person.track_id,
                 self.ppe_detector.detect(frame, person),
             )
+            self.ppe_review.add(review_frame, person.track_id, ppe)
+            person_zone = zone_for(_centre(person.xyxy), width, height)
             if matched:
                 employee = EMPLOYEE_MARKERS.get(matched.marker_id)
                 if employee:
@@ -467,13 +614,21 @@ class EdgePipeline:
                     )
                     if employee["badgeMarkerId"] != matched.marker_id:
                         matched = None
+            elif person.track_id in reentry_by_track:
+                employee, reassociation_event_id = self._reassociate_track_identity(
+                    person.track_id,
+                    reentry_by_track[person.track_id],
+                    observed_at,
+                    person_zone,
+                )
             else:
                 # A badge verifies the person track once. Keep that identity for the
                 # complete visible track session; the configured timeout applies only
                 # after the person track disappears, never to badge occlusion.
                 employee = self.track_employee_binding.get(person.track_id)
-            person_zone = zone_for(_centre(person.xyxy), width, height)
             self._draw_person(frame, person, ppe, employee, person_zone)
+            if reassociation_event_id is not None:
+                self.evidence.capture(reassociation_event_id, frame)
             self._check_identity(employee, person, person_zone, frame)
             if employee:
                 resolved_employee = True
@@ -497,6 +652,7 @@ class EdgePipeline:
                     self._set_active_unidentified(person, person_zone, ppe)
                 self._check_ppe(None, person, person_zone, ppe, frame)
                 self._check_movement(None, person, person_zone, frame)
+            self._maybe_auto_ppe_review(person.track_id, ppe)
 
         if not resolved_subject and employee_markers:
             marker = employee_markers[0]
@@ -526,7 +682,7 @@ class EdgePipeline:
         if not resolved_subject and self.active_employee and now - self.active_subject_last_seen > 2:
             self.active_employee = None
         for employee_id, last_seen in list(self.employee_last_seen.items()):
-            if now - last_seen > 10:
+            if now - last_seen > 10 and employee_id not in self.identity_sessions:
                 self.employee_first_seen.pop(employee_id, None)
                 self.employee_last_seen.pop(employee_id, None)
         for track_id, last_seen in list(self.track_last_seen.items()):
@@ -548,6 +704,8 @@ class EdgePipeline:
                 self.identity_missing_since.pop(track_id, None)
                 self.identity_alerted.discard(track_id)
                 self.ppe_stabilizer.clear_track(track_id)
+                self.ppe_review.clear_track(track_id)
+                self._last_ai_review_signature.pop(track_id, None)
 
         self._draw_markers(frame, markers)
         self._draw_header(frame)
@@ -559,6 +717,84 @@ class EdgePipeline:
         self.track_employee_binding_seen.pop(track_id, None)
         self.track_employee_binding_verified_at.pop(track_id, None)
         self.track_employee_binding_confidence.pop(track_id, None)
+        self.track_identity_association.pop(track_id, None)
+        self.identity_reentry_candidates.pop(track_id, None)
+
+    def _promote_transient_subject_state(self, track_id: int, employee_id: str) -> None:
+        anonymous_key = f"track:{track_id}"
+        for state in (
+            self.ppe_missing_since,
+            self.ppe_recovery_since,
+            self.ppe_observed_at,
+        ):
+            for item in ITEM_ORDER:
+                anonymous_item = (anonymous_key, item)
+                employee_item = (employee_id, item)
+                if anonymous_item in state and employee_item not in state:
+                    state[employee_item] = state[anonymous_item]
+                state.pop(anonymous_item, None)
+        for item in ITEM_ORDER:
+            anonymous_item = (anonymous_key, item)
+            if anonymous_item in self.ppe_alerted:
+                self.ppe_alerted.add((employee_id, item))
+                self.ppe_alerted.discard(anonymous_item)
+        for state in (
+            self.movement_zone,
+            self.movement_candidate,
+            self.movement_last_event,
+        ):
+            if anonymous_key in state and employee_id not in state:
+                state[employee_id] = state[anonymous_key]
+            state.pop(anonymous_key, None)
+
+    def _demote_transient_subject_state(self, track_id: int, employee_id: str) -> None:
+        anonymous_key = f"track:{track_id}"
+        for state in (
+            self.ppe_missing_since,
+            self.ppe_recovery_since,
+            self.ppe_observed_at,
+        ):
+            for item in ITEM_ORDER:
+                employee_item = (employee_id, item)
+                anonymous_item = (anonymous_key, item)
+                if employee_item in state and anonymous_item not in state:
+                    state[anonymous_item] = state[employee_item]
+                state.pop(employee_item, None)
+        for item in ITEM_ORDER:
+            employee_item = (employee_id, item)
+            if employee_item in self.ppe_alerted:
+                self.ppe_alerted.add((anonymous_key, item))
+                self.ppe_alerted.discard(employee_item)
+        for state in (
+            self.movement_zone,
+            self.movement_candidate,
+            self.movement_last_event,
+        ):
+            if employee_id in state and anonymous_key not in state:
+                state[anonymous_key] = state[employee_id]
+            state.pop(employee_id, None)
+
+    def _associate_track_identity(
+        self,
+        track_id: int,
+        employee: dict[str, Any],
+        observed_at: float,
+        *,
+        verified_at: str,
+        badge_confidence: float,
+        association: str,
+    ) -> tuple[dict[str, Any], str]:
+        previous = self.track_employee_binding.get(track_id)
+        if previous is not None and previous["employeeId"] != employee["employeeId"]:
+            return previous
+        if previous is None:
+            self._promote_transient_subject_state(track_id, employee["employeeId"])
+        self.track_employee_binding[track_id] = employee
+        self.track_employee_binding_seen[track_id] = observed_at
+        self.track_employee_binding_verified_at[track_id] = verified_at
+        self.track_employee_binding_confidence[track_id] = badge_confidence
+        self.track_identity_association[track_id] = association
+        return employee
 
     def _bind_track_identity(
         self,
@@ -573,38 +809,91 @@ class EdgePipeline:
             # Never replace an active session identity with a conflicting badge in
             # the same track. A reset/expiry must establish a new session first.
             return previous
-        if previous is None:
-            anonymous_key = f"track:{track_id}"
-            employee_key = employee["employeeId"]
-            for state in (
-                self.ppe_missing_since,
-                self.ppe_recovery_since,
-                self.ppe_observed_at,
-            ):
-                for item in ITEM_ORDER:
-                    anonymous_item = (anonymous_key, item)
-                    employee_item = (employee_key, item)
-                    if anonymous_item in state and employee_item not in state:
-                        state[employee_item] = state[anonymous_item]
-                    state.pop(anonymous_item, None)
-            for item in ITEM_ORDER:
-                anonymous_item = (anonymous_key, item)
-                if anonymous_item in self.ppe_alerted:
-                    self.ppe_alerted.add((employee_key, item))
-                    self.ppe_alerted.discard(anonymous_item)
-            for state in (
-                self.movement_zone,
-                self.movement_candidate,
-                self.movement_last_event,
-            ):
-                if anonymous_key in state and employee_key not in state:
-                    state[employee_key] = state[anonymous_key]
-                state.pop(anonymous_key, None)
-        self.track_employee_binding[track_id] = employee
-        self.track_employee_binding_seen[track_id] = observed_at
-        self.track_employee_binding_verified_at[track_id] = iso()
-        self.track_employee_binding_confidence[track_id] = marker.confidence
-        return employee
+        verified_at = iso()
+        associated = self._associate_track_identity(
+            track_id,
+            employee,
+            observed_at,
+            verified_at=verified_at,
+            badge_confidence=marker.confidence,
+            association="badge",
+        )
+        if associated["employeeId"] == employee["employeeId"]:
+            self.identity_sessions[employee["employeeId"]] = {
+                "employee": employee,
+                "cameraId": camera_id_for_settings(self.settings),
+                "verifiedAt": verified_at,
+                "badgeConfidence": marker.confidence,
+                "lastTrackId": track_id,
+                "lastSeenMonotonic": observed_at,
+                "lastSeenAt": verified_at,
+                "previousTrackId": None,
+                "reassociatedAt": None,
+            }
+        return associated
+
+    def _reassociate_track_identity(
+        self,
+        track_id: int,
+        session: dict[str, Any],
+        observed_at: float,
+        zone: str,
+    ) -> dict[str, Any]:
+        employee = session["employee"]
+        employee_id = employee["employeeId"]
+        previous_track_id = int(session["lastTrackId"])
+        gap_seconds = max(0.0, observed_at - float(session["lastSeenMonotonic"]))
+        for bound_track_id, bound_employee in list(self.track_employee_binding.items()):
+            if bound_track_id != track_id and bound_employee["employeeId"] == employee_id:
+                self._clear_track_identity(bound_track_id)
+        associated = self._associate_track_identity(
+            track_id,
+            employee,
+            observed_at,
+            verified_at=str(session["verifiedAt"]),
+            badge_confidence=float(session["badgeConfidence"]),
+            association="session_reentry",
+        )
+        reassociated_at = iso()
+        session.update(
+            {
+                "lastTrackId": track_id,
+                "lastSeenMonotonic": observed_at,
+                "lastSeenAt": reassociated_at,
+                "previousTrackId": previous_track_id,
+                "reassociatedAt": reassociated_at,
+            }
+        )
+        event = self.store.add_event(
+            EventInput(
+                type="identity_session_reassociated",
+                title=f"{employee['displayName']} session reassociated",
+                detail=(
+                    "One returning track was associated with the only eligible remembered "
+                    "badge session on this camera; the badge is not currently visible."
+                ),
+                severity="info",
+                source_mode=self.vision_source_mode,
+                employee_id=employee_id,
+                employee_name=employee["displayName"],
+                zone=zone,
+                confidence=None,
+                track_id=track_id,
+            ),
+            metadata={
+                "source_origin": self.vision_source_origin,
+                "identity_method": "session_reentry",
+                "badge_marker_id": employee["badgeMarkerId"],
+                "badge_verified_at": session["verifiedAt"],
+                "previous_track_id": previous_track_id,
+                "new_track_id": track_id,
+                "absence_seconds": round(gap_seconds, 3),
+                "reentry_window_seconds": self.settings.identity_reentry_seconds,
+                "camera_id": session["cameraId"],
+                "biometric_matching": False,
+            },
+        )
+        return associated, event["id"]
 
     def _set_active_employee(
         self,
@@ -617,9 +906,22 @@ class EdgePipeline:
         badge_visible: bool,
     ) -> None:
         employee_id = employee["employeeId"]
+        observed_at = time.monotonic()
         entered = self.employee_first_seen.setdefault(employee_id, iso())
-        self.employee_last_seen[employee_id] = time.monotonic()
-        self.active_subject_last_seen = time.monotonic()
+        self.employee_last_seen[employee_id] = observed_at
+        self.active_subject_last_seen = observed_at
+        session = self.identity_sessions.get(employee_id)
+        if session is not None:
+            session["lastTrackId"] = person.track_id
+            session["lastSeenMonotonic"] = observed_at
+            session["lastSeenAt"] = iso()
+        association = (
+            "badge_visible"
+            if badge_visible
+            else "session_reentry"
+            if self.track_identity_association.get(person.track_id) == "session_reentry"
+            else "track_session"
+        )
         elapsed = max(
             0,
             int((datetime.now(UTC) - datetime.fromisoformat(entered.replace("Z", "+00:00"))).total_seconds()),
@@ -630,8 +932,12 @@ class EdgePipeline:
             "photoUrl": employee.get("photoUrl"),
             "badgeMarkerId": employee["badgeMarkerId"],
             "identityMethod": "aruco_badge",
-            "identityAssociation": "badge_visible" if badge_visible else "track_session",
+            "identityAssociation": association,
             "identityVerifiedAt": self.track_employee_binding_verified_at.get(person.track_id),
+            "identityReassociatedAt": session.get("reassociatedAt") if session else None,
+            "identityPreviousTrackId": session.get("previousTrackId") if session else None,
+            "identitySessionWindowSeconds": self.settings.identity_reentry_seconds,
+            "identitySessionExpiresInSeconds": self.settings.identity_reentry_seconds,
             "trackId": person.track_id,
             "zone": person_zone,
             "activity": self._activity_context(person_zone),
@@ -796,6 +1102,7 @@ class EdgePipeline:
                 )
                 self.evidence.capture(event["id"], frame)
                 self.ppe_alerted.discard(key)
+                self.ppe_alert_event_by_track_item.pop((person.track_id, item), None)
                 self.ppe_recovery_since.pop(key, None)
                 continue
 
@@ -837,6 +1144,7 @@ class EdgePipeline:
             )
             self.evidence.capture(event["id"], frame)
             self.ppe_alerted.add(key)
+            self.ppe_alert_event_by_track_item[(person.track_id, item)] = event["id"]
             violation_created = True
 
     def _ppe_evidence_metadata(
@@ -1291,6 +1599,84 @@ class EdgePipeline:
             last_frame = frame
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
 
+    def request_ppe_review(self) -> dict[str, Any]:
+        """Queue an advisory review from fresh server-selected PPE observations."""
+        with self.lock:
+            track_id = self.active_employee.get("trackId") if self.active_employee else None
+            if track_id is None:
+                raise PPEReviewUnavailable(
+                    "No tracked person is available. Stand in view and wait for PPE assessment."
+                )
+            return self._create_ppe_review(int(track_id), trigger="manual")
+
+    def _create_ppe_review(self, track_id: int, *, trigger: str) -> dict[str, Any]:
+        bundle = self.ppe_review.build(track_id)
+        event_ids = [
+            event_id
+            for item in ("mask", "left_glove", "right_glove")
+            if (event_id := self.ppe_alert_event_by_track_item.get((track_id, item)))
+        ]
+        source_record_ids = list(dict.fromkeys(event_ids))
+        frame_reference = f"camera-state:{self.last_frame_at or iso()}"
+        source_record_ids.append(frame_reference)
+        signature = tuple(sorted(bundle.local_decisions.items()))
+        job = self.ai.create_ppe_review_job(
+            images=bundle.images,
+            regions=bundle.regions,
+            local_decisions=bundle.local_decisions,
+            source_record_ids=source_record_ids,
+            metadata={
+                **bundle.metadata,
+                "trigger": trigger,
+                "cameraSource": self.settings.camera_label,
+                "sourceMode": self.vision_source_mode,
+                "frameReference": frame_reference,
+            },
+            dedupe_key=f"{track_id}:{signature}",
+        )
+        self.latest_ppe_review_job_id = str(job["id"])
+        return job
+
+    def _maybe_auto_ppe_review(self, track_id: int, ppe: PPEResult) -> None:
+        if not self.settings.ai_ppe_auto_review_enabled or not self.ai.status()["available"]:
+            return
+        stable = tuple(
+            (item, ppe.items[item].state)
+            for item in ("mask", "left_glove", "right_glove")
+            if ppe.items[item].state in {"detected", "missing"}
+        )
+        if not stable or self._last_ai_review_signature.get(track_id) == stable:
+            return
+        missing_items = [item for item, state in stable if state == "missing"]
+        if any(
+            (track_id, item) not in self.ppe_alert_event_by_track_item
+            for item in missing_items
+        ):
+            return
+        try:
+            job = self._create_ppe_review(track_id, trigger="automatic")
+        except PPEReviewUnavailable:
+            return
+        if job["status"] in {"queued", "analyzing", "completed", "needs_review"}:
+            self._last_ai_review_signature[track_id] = stable
+
+    def _ai_ppe_assurance_state(self) -> dict[str, Any]:
+        track_id = self.active_employee.get("trackId") if self.active_employee else None
+        readiness = self.ppe_review.readiness(int(track_id) if track_id is not None else None)
+        job = None
+        if self.latest_ppe_review_job_id:
+            try:
+                job = self.store.get_ai_job(self.latest_ppe_review_job_id)
+            except KeyError:
+                self.latest_ppe_review_job_id = None
+        return {
+            "provider": self.ai.status(),
+            "readiness": readiness,
+            "latestJob": job,
+            "advisoryOnly": True,
+            "localDecisionAuthoritative": True,
+        }
+
     def state(self) -> dict[str, Any]:
         now = iso()
         monitoring_state, monitoring_message = self._automatic_monitoring_status()
@@ -1344,12 +1730,53 @@ class EdgePipeline:
                 "updatedAt": now,
             },
             "activeEmployee": self.active_employee,
+            "identitySessions": self._identity_sessions_state(),
             "detection": self._detection_state(),
+            "aiPpeAssurance": self._ai_ppe_assurance_state(),
             "process": process,
             "temperature": self.temperature,
             "inventory": self.store.inventory(),
             "recentEvents": events,
         }
+
+    def run_ai_operation(self, action: str) -> dict[str, Any]:
+        return self.operations_supervisor.run(action)
+
+    def ai_feature_readiness(self) -> dict[str, Any]:
+        return {
+            "items": self.operations_supervisor.features(),
+            "advisoryOnly": True,
+            "localRecordsAuthoritative": True,
+        }
+
+    def client_demo_preflight(self) -> dict[str, Any]:
+        return self.client_preflight.status(self.state())
+
+    def _identity_sessions_state(self) -> list[dict[str, Any]]:
+        observed_at = time.monotonic()
+        sessions: list[dict[str, Any]] = []
+        for employee_id, session in self.identity_sessions.items():
+            elapsed = max(0.0, observed_at - float(session["lastSeenMonotonic"]))
+            remaining = max(0, int(self.settings.identity_reentry_seconds - elapsed + 0.999))
+            sessions.append(
+                {
+                    "employeeId": employee_id,
+                    "displayName": session["employee"]["displayName"],
+                    "badgeMarkerId": session["employee"]["badgeMarkerId"],
+                    "cameraId": session["cameraId"],
+                    "status": "active" if elapsed <= 2 else "dormant",
+                    "lastTrackId": session["lastTrackId"],
+                    "verifiedAt": session["verifiedAt"],
+                    "lastSeenAt": session["lastSeenAt"],
+                    "reassociatedAt": session.get("reassociatedAt"),
+                    "expiresInSeconds": remaining,
+                    "windowSeconds": int(self.settings.identity_reentry_seconds),
+                    "association": self.track_identity_association.get(
+                        int(session["lastTrackId"]), "remembered"
+                    ),
+                }
+            )
+        return sorted(sessions, key=lambda item: item["displayName"])
 
     def _automatic_monitoring_status(self) -> tuple[str, str]:
         """Report whether the always-on local detection loop can evaluate new frames."""
@@ -1435,6 +1862,11 @@ class EdgePipeline:
                 "detail": (
                     "Badge is visible and verifies this active person track."
                     if subject.get("identityAssociation") == "badge_visible"
+                    else (
+                        "The only eligible remembered badge session was conservatively "
+                        "reassociated after this person returned; no biometric matching was used."
+                    )
+                    if subject.get("identityAssociation") == "session_reentry"
                     else "Badge was verified earlier; identity remains bound to this active person track."
                     if identity_detected
                     else "Optional badge or access-control association; PPE monitoring remains active."
@@ -1476,6 +1908,9 @@ class EdgePipeline:
             self.track_employee_binding_seen.clear()
             self.track_employee_binding_verified_at.clear()
             self.track_employee_binding_confidence.clear()
+            self.track_identity_association.clear()
+            self.identity_sessions.clear()
+            self.identity_reentry_candidates.clear()
             self.track_paths.clear()
             self.movement_zone.clear()
             self.movement_candidate.clear()
@@ -1490,11 +1925,32 @@ class EdgePipeline:
             self.ppe_stabilizer.reset()
             self.ppe_missing_since.clear()
             self.ppe_alerted.clear()
+            self.ppe_alert_event_by_track_item.clear()
             self.ppe_recovery_since.clear()
             self.ppe_observed_at.clear()
+            self.ppe_review.clear()
+            self.latest_ppe_review_job_id = None
+            self._last_ai_review_signature.clear()
             self.detection_reset_generation += 1
             self.last_detection_reset_at = iso()
             return self._detection_state()
+
+    def clear_identity_sessions(self) -> dict[str, Any]:
+        """Clear remembered identity only; retained events and live PPE state remain."""
+        with self.lock:
+            removed = len(self.identity_sessions)
+            for track_id, employee in list(self.track_employee_binding.items()):
+                self._demote_transient_subject_state(track_id, employee["employeeId"])
+                self._clear_track_identity(track_id)
+            self.identity_sessions.clear()
+            self.identity_reentry_candidates.clear()
+            self.employee_first_seen.clear()
+            self.employee_last_seen.clear()
+            self.identity_missing_since.clear()
+            self.identity_alerted.clear()
+            self.active_employee = None
+            self.active_subject_last_seen = 0.0
+            return {"clearedSessions": removed, "retainedEventsDeleted": 0}
 
     def _livekit_frame(self) -> np.ndarray | None:
         with self.lock:
@@ -1649,9 +2105,13 @@ class EdgePipeline:
                 self.temperature = self.temperature_source.read().payload()
             self.ppe_missing_since.clear()
             self.ppe_alerted.clear()
+            self.ppe_alert_event_by_track_item.clear()
             self.ppe_recovery_since.clear()
             self.ppe_observed_at.clear()
             self.ppe_stabilizer.reset()
+            self.ppe_review.clear()
+            self.latest_ppe_review_job_id = None
+            self._last_ai_review_signature.clear()
             self.active_employee = None
             self.active_subject_last_seen = 0.0
             self.track_first_seen.clear()
@@ -1660,4 +2120,7 @@ class EdgePipeline:
             self.track_employee_binding_seen.clear()
             self.track_employee_binding_verified_at.clear()
             self.track_employee_binding_confidence.clear()
+            self.track_identity_association.clear()
+            self.identity_sessions.clear()
+            self.identity_reentry_candidates.clear()
             return removed

@@ -57,8 +57,12 @@ export interface ActiveEmployee {
   photoUrl?: string | null;
   badgeMarkerId?: number | null;
   identityMethod?: "aruco_badge";
-  identityAssociation?: "badge_visible" | "track_session" | "not_associated";
+  identityAssociation?: "badge_visible" | "track_session" | "session_reentry" | "not_associated";
   identityVerifiedAt?: string | null;
+  identityReassociatedAt?: string | null;
+  identityPreviousTrackId?: number | null;
+  identitySessionWindowSeconds?: number;
+  identitySessionExpiresInSeconds?: number;
   trackId: number | null;
   zone: string;
   activity: string;
@@ -67,6 +71,21 @@ export interface ActiveEmployee {
   badgeConfidence: number | null;
   personConfidence?: number | null;
   ppe: PpeStatus;
+}
+
+export interface IdentitySession {
+  employeeId: string;
+  displayName: string;
+  badgeMarkerId: number;
+  cameraId: string;
+  status: "active" | "dormant";
+  lastTrackId: number;
+  verifiedAt: string;
+  lastSeenAt: string;
+  reassociatedAt: string | null;
+  expiresInSeconds: number;
+  windowSeconds: number;
+  association: "badge" | "session_reentry" | "remembered";
 }
 
 export interface DetectionIssue {
@@ -202,10 +221,148 @@ export interface CameraCatalog {
   message: string | null;
 }
 
+export type AIJobStatus = "queued" | "analyzing" | "completed" | "needs_review" | "unavailable" | "failed";
+
+export interface AIPpeRegionReview {
+  region: "lower_face" | "left_hand" | "right_hand";
+  localDecision: "present" | "missing";
+  aiDecision: "present" | "missing" | "uncertain";
+  imageQuality: "adequate" | "poor";
+  reason: string;
+  agreement: boolean;
+}
+
+export interface AIJob {
+  id: string;
+  action: string;
+  status: AIJobStatus;
+  sourceRecordIds: string[];
+  model: string;
+  promptVersion: string;
+  result: null | {
+    assurance?: "two_model_agreement" | "needs_human_review";
+    regions?: AIPpeRegionReview[];
+    sourceRecordIds?: string[];
+    evidence?: {
+      trackId?: number;
+      trigger?: "manual" | "automatic";
+      cameraSource?: string;
+      sourceMode?: SourceMode;
+      frameReference?: string;
+      contactSheetsPersisted?: boolean;
+      regions?: Array<{
+        item: string;
+        region: string;
+        frameCount: number;
+        capturedAt: string;
+        sourceAgeMs: number;
+        visibilityConfidence: number;
+        brightness: number;
+      }>;
+    };
+    aiAssisted?: boolean;
+    advisoryOnly?: boolean;
+    authoritativeSource?: "local_edge" | "local_operational_records";
+    outcome?: "supported" | "insufficient_evidence" | "needs_review";
+    summary?: string;
+    rationale?: string;
+    exactFacts?: Record<string, unknown>;
+  };
+  latencyMs: number | null;
+  failure: { code: string; detail: string } | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export type AIOperationsAction =
+  | "explain_latest_alert"
+  | "interpret_process"
+  | "analyze_inventory"
+  | "review_cold_chain"
+  | "show_sop_guidance"
+  | "review_operations"
+  | "generate_shift_summary";
+
+export interface AIFeatureReadiness {
+  action: AIOperationsAction;
+  label: string;
+  description: string;
+  enabled: boolean;
+  gates: {
+    configuration: boolean;
+    automatedTests: boolean;
+    groundedFixtures: boolean;
+    liveSmoke: boolean;
+  };
+  checkedAt: string | null;
+  expiresAt: string | null;
+  current: boolean;
+  ready: boolean;
+  detail: string;
+  recovery: string;
+}
+
+export interface AIFeatureCatalog {
+  items: AIFeatureReadiness[];
+  advisoryOnly: true;
+  localRecordsAuthoritative: true;
+}
+
+export interface PreflightCheck {
+  id: string;
+  label: string;
+  status: "passed" | "pending" | "failed";
+  detail: string;
+  recovery: string;
+  critical: boolean;
+}
+
+export interface ClientDemoPreflight {
+  status: "ready" | "blocked";
+  generatedAt: string;
+  checks: PreflightCheck[];
+  aiFeatures: AIFeatureReadiness[];
+  summary: {
+    passed: number;
+    pending: number;
+    failed: number;
+    readyAiActions: number;
+    totalAiActions: number;
+  };
+  clientBoundary: string;
+}
+
+export interface AIPpeAssuranceState {
+  provider: {
+    provider: string;
+    configured: boolean;
+    available: boolean;
+    model: string;
+    promptVersion: string;
+    queueDepth: number;
+    queueCapacity: number;
+    lastSuccessfulJobAt: string | null;
+    lastFailure: { code: string; detail: string; at: string } | null;
+    circuit: { state: "open" | "closed"; retryAfterSeconds: number };
+    localMonitoringUnaffected: true;
+  };
+  readiness: {
+    ready: boolean;
+    regions: string[];
+    unavailableRegions: string[];
+    guidance: string | null;
+  };
+  latestJob: AIJob | null;
+  advisoryOnly: true;
+  localDecisionAuthoritative: true;
+}
+
 export interface LiveState {
   health: DeviceHealth;
   activeEmployee: ActiveEmployee | null;
+  identitySessions: IdentitySession[];
   detection: DetectionState;
+  aiPpeAssurance: AIPpeAssuranceState;
   process: ProcessState;
   temperature: TemperatureState;
   inventory: InventoryItem[];

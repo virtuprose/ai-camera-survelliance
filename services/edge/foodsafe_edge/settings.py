@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,11 @@ class Settings(BaseSettings):
     # Keep a badge-verified identity available while its person track is active.
     # This value is only the grace period after that track disappears.
     identity_binding_seconds: float = 30.0
+    # A separate conservative session can reassociate one returning person with
+    # one remembered badge identity on the same camera. It is not biometric
+    # recognition and is never used when the scene is ambiguous.
+    identity_reentry_seconds: float = 600.0
+    identity_reentry_stability_seconds: float = 1.0
     ppe_keypoint_confidence: float = 0.45
     ppe_minimum_brightness: float = 55.0
     ppe_mask_colour: Literal["blue", "red"] = "blue"
@@ -74,6 +80,23 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
     livekit_room: str = "foodsafe-kitchen-01"
+
+    ai_provider: Literal["openai"] = "openai"
+    openai_api_key: SecretStr = SecretStr("")
+    openai_model: str = "gpt-5.6-terra"
+    openai_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
+    ai_timeout_seconds: float = 8.0
+    ai_retry_count: int = 1
+    ai_rate_limit_per_minute: int = 6
+    ai_queue_capacity: int = 8
+    ai_circuit_failure_threshold: int = 3
+    ai_circuit_recovery_seconds: float = 30.0
+    ai_max_output_tokens: int = 700
+    ai_prompt_version: str = "phase5-operations-supervisor-v1"
+    ai_ppe_auto_review_enabled: bool = True
+    ai_ppe_min_observations: int = 3
+    ai_ppe_observation_max_age_seconds: float = 4.0
+    ai_ppe_min_visibility_confidence: float = 0.45
 
     data_dir: Path = ROOT / "data"
 

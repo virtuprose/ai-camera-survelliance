@@ -86,7 +86,12 @@ async function main() {
     start(
       ["uv", "run", "uvicorn", "foodsafe_edge.main:app", "--host", "127.0.0.1", "--port", "8787"],
       edgeRoot,
-      { CAMERA_ENABLED: "false", DATA_DIR: "data/e2e" },
+      {
+        CAMERA_ENABLED: "false",
+        DATA_DIR: "data/e2e",
+        OPENAI_API_KEY: "",
+        AI_PPE_AUTO_REVIEW_ENABLED: "false",
+      },
     );
   }
 

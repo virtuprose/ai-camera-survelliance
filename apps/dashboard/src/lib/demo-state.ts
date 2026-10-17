@@ -90,6 +90,7 @@ export const fallbackState: LiveState = {
     updatedAt: now.toISOString(),
   },
   activeEmployee: null,
+  identitySessions: [],
   detection: {
     status: "idle",
     trackId: null,
@@ -107,6 +108,30 @@ export const fallbackState: LiveState = {
     resetGeneration: 0,
     lastResetAt: null,
     updatedAt: null,
+  },
+  aiPpeAssurance: {
+    provider: {
+      provider: "openai",
+      configured: false,
+      available: false,
+      model: "gpt-5.6-terra",
+      promptVersion: "phase3-ppe-assurance-v1",
+      queueDepth: 0,
+      queueCapacity: 8,
+      lastSuccessfulJobAt: null,
+      lastFailure: null,
+      circuit: { state: "closed", retryAfterSeconds: 0 },
+      localMonitoringUnaffected: true,
+    },
+    readiness: {
+      ready: false,
+      regions: [],
+      unavailableRegions: ["mask", "left_glove", "right_glove"],
+      guidance: "Connect the local edge service to prepare AI PPE review.",
+    },
+    latestJob: null,
+    advisoryOnly: true,
+    localDecisionAuthoritative: true,
   },
   process: {
     id: null,

@@ -4,10 +4,10 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { Activity, AlertTriangle, BadgeCheck, Box, Camera, Check, CheckCircle2, CircleGauge, CircleX, Clock3, FileCheck2, MapPin, PackageCheck, Play, Radio, RotateCcw, ScanLine, ShieldAlert, ShieldCheck, Square, Thermometer, TimerOff, UserRound, WifiOff, X } from "lucide-react";
-import { resetDetection, runDemoAction, useEdgeState } from "@/hooks/use-edge";
+import { Activity, AlertTriangle, BadgeCheck, Box, Camera, Check, CheckCircle2, CircleGauge, CircleX, Clock3, FileCheck2, MapPin, PackageCheck, Play, Radio, RotateCcw, ScanLine, ShieldAlert, ShieldCheck, Sparkles, Square, Thermometer, TimerOff, UserRound, WifiOff, X } from "lucide-react";
+import { clearIdentitySessions, getAIJob, requestPpeReview, resetDetection, runDemoAction, useEdgeState } from "@/hooks/use-edge";
 import { formatClock, formatDuration, formatRelative } from "@/lib/format";
-import type { ActiveEmployee, DetectionState, DeviceHealth, PpeAssessmentState, PpeItemAssessment, PpeStatus, Severity } from "@/lib/types";
+import type { AIJob, AIPpeAssuranceState, ActiveEmployee, DetectionState, DeviceHealth, PpeAssessmentState, PpeItemAssessment, PpeStatus, Severity } from "@/lib/types";
 import { PageHeader } from "@/components/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { LiveKitCamera } from "@/components/livekit-camera";
@@ -43,11 +43,16 @@ function confidence(value: number | null | undefined) {
 
 function identityBadgeLabel(employee: ActiveEmployee) {
   if (!employee.employeeId) return "Identity optional";
+  if (employee.identityAssociation === "session_reentry") return "Session reassociated";
   return employee.identityAssociation === "track_session" ? "Identity retained" : "Badge identified";
 }
 
 function identityAssociationText(employee: ActiveEmployee, referenceTime: number) {
   if (!employee.employeeId) return "PPE monitoring is active without employee identification. Badge or access-control matching can be added later.";
+  if (employee.identityAssociation === "session_reentry") {
+    const verified = formatRelative(employee.identityVerifiedAt ?? null, referenceTime);
+    return `Returned on Track ${employee.trackId ?? "—"} · conservatively reassociated with the only eligible 10-minute session · badge ${employee.badgeMarkerId ?? "—"} verified ${verified} · no biometric matching`;
+  }
   if (employee.identityAssociation === "track_session") {
     const verified = formatRelative(employee.identityVerifiedAt ?? null, referenceTime);
     return `Identity retained on Track ${employee.trackId ?? "—"} · badge ${employee.badgeMarkerId ?? "—"} verified ${verified} · no biometric matching`;
@@ -128,7 +133,7 @@ function AutomaticMonitoringBar({ health, detection, connected, previewFailed }:
   </section>;
 }
 
-function DetectionRail({ detection, cleared, busy, message, onClear, onReset }: { detection: DetectionState; cleared: boolean; busy: boolean; message: string | null; onClear: () => void; onReset: () => void }) {
+function DetectionRail({ detection, cleared, busy, hasIdentity, message, onClear, onClearIdentity, onReset }: { detection: DetectionState; cleared: boolean; busy: boolean; hasIdentity: boolean; message: string | null; onClear: () => void; onClearIdentity: () => void; onReset: () => void }) {
   if (detection.status === "idle") return message ? <div className="detection-reset-message" role="status"><CheckCircle2 />{message}</div> : null;
   const attention = detection.status === "attention";
   const observing = detection.status === "observing";
@@ -136,15 +141,100 @@ function DetectionRail({ detection, cleared, busy, message, onClear, onReset }: 
   const itemAssessments = PPE_ITEM_ORDER.flatMap((item) => detection.ppeItems[item] ? [[item, detection.ppeItems[item]] as const] : []);
   const heading = attention ? "PPE action required" : observing ? proof?.assessmentAvailable === false ? "PPE assessment unavailable" : "PPE assessment in progress" : "Controlled PPE signals verified";
   const description = attention ? "A visible PPE region remained unverified beyond the configured persistence period." : observing ? "Only visible body regions are assessed. Follow the camera guidance to complete the check." : "Mask and both visible hand signals passed the controlled-scene stability rules.";
-  if (cleared) return <section className="detection-rail is-cleared" aria-label="Live detection status"><div><CheckCircle2 /><span><strong>Warnings cleared for Track {detection.trackId}</strong><small>Live tracking continues. A changed identity or PPE state will show a new warning.</small></span></div><Button variant="outline" size="sm" disabled={busy} onClick={onReset}><RotateCcw />{busy ? "Resetting…" : "Reset detection"}</Button></section>;
+  if (cleared) return <section className="detection-rail is-cleared" aria-label="Live detection status"><div><CheckCircle2 /><span><strong>Warnings cleared for Track {detection.trackId}</strong><small>Live tracking continues. A changed identity or PPE state will show a new warning.</small></span></div><div>{hasIdentity && <Button variant="outline" size="sm" disabled={busy} onClick={onClearIdentity}><UserRound />Clear identity session</Button>}<Button variant="outline" size="sm" disabled={busy} onClick={onReset}><RotateCcw />{busy ? "Working…" : "Reset detection"}</Button></div></section>;
   return <section className={`detection-rail ${attention ? "is-attention" : observing ? "is-observing" : "is-compliant"}`} aria-label="Live detection status" role={attention ? "alert" : "status"}>
     <div className="detection-rail-heading"><span className="detection-state-icon">{attention ? <CircleX /> : observing ? <CircleGauge /> : <CheckCircle2 />}</span><div><span className="eyebrow">Live person tracking · Track {detection.trackId}</span><strong>{heading}</strong><small>{description}</small></div><StatusBadge tone={attention ? "critical" : observing ? "warning" : "safe"} label={attention ? "Live warning" : observing ? "Assessing" : "Compliant"} /></div>
-    <div className="identity-association"><UserRound /><span><strong>{detection.identityStatus.label}</strong><small>{detection.identityStatus.detail}</small></span><StatusBadge tone="info" label="Optional identity" /></div>
+    <div className="identity-association"><UserRound /><span><strong>{detection.identityStatus.label}</strong><small>{detection.identityStatus.detail}</small></span><StatusBadge tone="info" label={detection.identityDetected ? "Identity associated" : "Optional identity"} /></div>
     {attention && <ol className="detection-issues">{detection.issues.map((issue) => <li key={issue.code}><CircleX /><span><strong>{issue.title}</strong><small>{issue.detail}</small></span></li>)}</ol>}
     {itemAssessments.length > 0 && <ol className="detection-assessments" aria-label="Current PPE assessments">{itemAssessments.map(([item, assessment]) => <li className={`is-${assessment.state.replace("not_visible", "not-visible")} ${assessment.required === false ? "is-monitor-only" : ""}`} key={item}>{assessment.state === "detected" ? <CheckCircle2 /> : assessment.state === "missing" ? <CircleX /> : <CircleGauge />}<span><strong>{assessmentText(item, assessment)}{assessment.required === false ? " · monitor only" : ""}</strong><small>{assessment.required === false ? "Rule disabled for tomorrow’s mask-and-gloves acceptance" : assessment.state === "not_visible" ? "No violation recorded" : assessment.state === "checking" ? "Building a stable 15-frame decision" : assessment.state === "unavailable" ? "Pose landmarks are unavailable" : `Decision ${confidence(assessment.confidence)} · visibility ${confidence(assessment.visibilityConfidence)}`}</small></span></li>)}</ol>}
     {detection.readiness?.guidance.length ? <div className="camera-guidance" role="status"><AlertTriangle /><span><strong>Camera guidance</strong>{detection.readiness.guidance.map((guidance) => <small key={guidance}>{guidance}</small>)}</span></div> : null}
     {proof && <dl className="detection-proof" aria-label="Live detection proof"><div><dt><MapPin />Zone</dt><dd>{proof.zone}</dd></div><div><dt><ScanLine />Person confidence</dt><dd className="mono">{confidence(proof.personConfidence)}</dd></div><div><dt><ShieldCheck />Signal confidence</dt><dd className="mono">{confidence(proof.ppeConfidence)}</dd></div><div><dt><CircleGauge />Lighting</dt><dd className="mono">{proof.brightness == null ? "—" : `${Math.round(proof.brightness)}/255`}</dd></div><div><dt><Activity />Movement trail</dt><dd className="mono">{proof.movementSamples} samples</dd></div><div><dt><FileCheck2 />Event evidence</dt><dd>Snapshot + clip after persistence</dd></div></dl>}
-    <div className="detection-rail-actions"><p>Clearing hides this live warning only. Stored events and evidence remain unchanged.</p>{message && <span role="status">{message}</span>}<div>{attention && <Button variant="outline" size="sm" onClick={onClear}><X />Clear warnings</Button>}<Button variant="outline" size="sm" disabled={busy} onClick={onReset}><RotateCcw />{busy ? "Resetting…" : "Reset detection"}</Button></div></div>
+    <div className="detection-rail-actions"><p>Clearing identity removes the remembered session only. Stored events and evidence remain unchanged.</p>{message && <span role="status">{message}</span>}<div>{attention && <Button variant="outline" size="sm" onClick={onClear}><X />Clear warnings</Button>}{hasIdentity && <Button variant="outline" size="sm" disabled={busy} onClick={onClearIdentity}><UserRound />Clear identity session</Button>}<Button variant="outline" size="sm" disabled={busy} onClick={onReset}><RotateCcw />{busy ? "Working…" : "Reset detection"}</Button></div></div>
+  </section>;
+}
+
+const AI_REGION_LABELS: Record<string, string> = {
+  lower_face: "Mask / lower face",
+  left_hand: "Left glove",
+  right_hand: "Right glove",
+};
+
+function decisionLabel(value: string) {
+  if (value === "present") return "Present";
+  if (value === "missing") return "Missing";
+  return "Uncertain";
+}
+
+function AIPpeAssurancePanel({ assurance, connected }: { assurance: AIPpeAssuranceState; connected: boolean }) {
+  const [requestedJob, setRequestedJob] = useState<AIJob | null>(null);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const latestJob = requestedJob?.id === assurance.latestJob?.id ? requestedJob : assurance.latestJob ?? requestedJob;
+  const working = latestJob?.status === "queued" || latestJob?.status === "analyzing";
+
+  useEffect(() => {
+    if (!working || !latestJob) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await getAIJob(latestJob.id);
+        setRequestedJob(next);
+      } catch {
+        setRequestError("AI review status could not be refreshed. Local monitoring continues.");
+      }
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [latestJob, working]);
+
+  async function reviewCurrentPpe() {
+    setRequestError(null);
+    try {
+      setRequestedJob(await requestPpeReview());
+    } catch (reason) {
+      setRequestError(reason instanceof Error ? reason.message : "AI review could not be started.");
+    }
+  }
+
+  const unavailable = !connected || !assurance.provider.available;
+  const result = latestJob?.result;
+  const agreement = latestJob?.status === "completed" && result?.assurance === "two_model_agreement";
+  const needsReview = latestJob?.status === "needs_review" || result?.assurance === "needs_human_review";
+  let title = "Ready for a second opinion";
+  let detail = "The edge service will send only fresh, visible PPE contact sheets when requested.";
+  let tone: "safe" | "warning" | "critical" | "info" = "info";
+  if (unavailable) {
+    title = "Cloud unavailable — local monitoring continues";
+    detail = assurance.provider.configured ? "The advisory service is temporarily unavailable." : "Add the edge-only OpenAI key to enable advisory review.";
+    tone = "warning";
+  } else if (working) {
+    title = "Analyzing selected evidence";
+    detail = "Local mask and glove decisions remain active while the advisory review runs.";
+  } else if (agreement) {
+    title = "Two-model agreement";
+    detail = "The local detector and AI reviewer agree on every submitted visible region.";
+    tone = "safe";
+  } else if (needsReview) {
+    title = "Needs human review";
+    detail = "The local and AI decisions differ, or the submitted evidence was uncertain.";
+    tone = "critical";
+  } else if (latestJob?.status === "unavailable" || latestJob?.status === "failed") {
+    title = "AI review unavailable";
+    detail = latestJob.failure?.detail ?? "The review failed safely; local monitoring continues.";
+    tone = "warning";
+  } else if (!assurance.readiness.ready) {
+    title = "Improve framing and try again";
+    detail = assurance.readiness.guidance ?? "Keep visible PPE regions steady until the local decision stabilizes.";
+    tone = "warning";
+  }
+
+  return <section className={`ai-ppe-assurance is-${tone}`} aria-labelledby="ai-ppe-title">
+    <div className="ai-ppe-heading">
+      <span className="ai-ppe-icon"><Sparkles /></span>
+      <div><span className="eyebrow">AI-assisted · advisory only</span><strong id="ai-ppe-title">AI PPE Assurance</strong><small>{title}</small></div>
+      <StatusBadge tone={tone} label={working ? "Analyzing" : needsReview ? "Review" : agreement ? "Agreement" : unavailable ? "Unavailable" : "Ready"} />
+    </div>
+    <p className="ai-ppe-detail" aria-live="polite">{requestError ?? detail}</p>
+    {result?.regions?.length ? <ol className="ai-ppe-results" aria-label="Local and AI PPE decisions">{result.regions.map((region) => <li key={region.region} className={region.agreement ? "is-agreement" : "is-disagreement"}><span><strong>{AI_REGION_LABELS[region.region] ?? region.region}</strong><small>{region.reason}</small></span><dl><div><dt>Local</dt><dd>{decisionLabel(region.localDecision)}</dd></div><div><dt>AI review</dt><dd>{decisionLabel(region.aiDecision)}</dd></div></dl>{region.agreement ? <CheckCircle2 aria-label="Decisions agree" /> : <AlertTriangle aria-label="Human review required" />}</li>)}</ol> : null}
+    <div className="ai-ppe-actions"><span>{result?.evidence?.trackId != null ? `Track ${result.evidence.trackId} · ${result.evidence.trigger ?? "advisory"} review` : assurance.readiness.regions.length ? `Ready: ${assurance.readiness.regions.map((region) => PPE_ITEM_LABELS[region] ?? region).join(", ")}` : "No reviewable region yet"}{result?.evidence?.regions?.length ? ` · evidence ${Math.max(...result.evidence.regions.map((region) => region.sourceAgeMs))} ms old at selection` : ""}{latestJob?.latencyMs != null ? ` · ${latestJob.latencyMs} ms` : ""}</span><Button size="sm" disabled={unavailable || working || !assurance.readiness.ready} onClick={() => void reviewCurrentPpe()}><Sparkles />{working ? "Analyzing…" : "Review current PPE"}</Button></div>
+    <small className="ai-ppe-boundary">The AI reviewer cannot identify staff, change local measurements, dismiss incidents, or overwrite evidence. Contact sheets are held in memory only.</small>
   </section>;
 }
 
@@ -157,6 +247,7 @@ export function LiveWorkspace() {
   const [dismissedDetectionKey, setDismissedDetectionKey] = useState<string | null>(null);
   const [detectionMessage, setDetectionMessage] = useState<string | null>(null);
   const [resettingDetection, setResettingDetection] = useState(false);
+  const [clearingIdentity, setClearingIdentity] = useState(false);
   const [clock, setClock] = useState<Date | null>(null);
 
   useEffect(() => {
@@ -229,6 +320,21 @@ export function LiveWorkspace() {
     }
   }
 
+  async function clearRememberedIdentity() {
+    setClearingIdentity(true);
+    setDetectionMessage(null);
+    try {
+      const result = await clearIdentitySessions();
+      setDismissedDetectionKey(null);
+      setDetectionMessage(`${result.clearedSessions} remembered identity session${result.clearedSessions === 1 ? "" : "s"} cleared. PPE monitoring and retained evidence continue.`);
+      await refresh();
+    } catch {
+      setDetectionMessage("The identity session could not be cleared. Confirm the local edge agent is online and try again.");
+    } finally {
+      setClearingIdentity(false);
+    }
+  }
+
   return <div className="page-shell live-page">
     <PageHeader eyebrow="Kitchen 01 · operational view" title="Live operations" description="Monitor staff compliance, preparation timing, stock movement, and temperature from one controlled camera." actions={<><span className="live-clock"><span className="live-pulse" />Live</span><time className="mono" dateTime={clock?.toISOString()}>{clock ? formatClock(clock.toISOString()) : "—"}</time><Sheet><SheetTrigger asChild><Button variant="outline"><Play />Tools</Button></SheetTrigger><SheetContent className="demo-sheet"><SheetHeader><SheetTitle>Operational tools</SheetTitle><SheetDescription>Use only when a physical prop is unavailable. Every created record is permanently marked Simulated.</SheetDescription></SheetHeader><StatusBadge tone="simulated" label="Always simulated" /><div className="demo-control-list"><div><span><Play />Process stage</span><Button disabled={busyAction !== null} onClick={() => void trigger(state.process.status === "running" ? "process-complete" : "process-start", state.process.status === "running" ? "Process completed." : "Process started.")}>{state.process.status === "running" ? <Square /> : <Play />}{state.process.status === "running" ? "Complete process" : "Start process"}</Button><Button variant="outline" disabled={busyAction !== null} onClick={() => void trigger("process-overtime", "Simulated process timing exception added.")}><TimerOff />Add overtime exception</Button></div><div><span><ShieldAlert />PPE exception</span><Button disabled={busyAction !== null} onClick={() => void trigger("ppe-violation", "Simulated glove violation added.")}><ShieldAlert />Add missing-gloves event</Button></div><div><span><Thermometer />Temperature</span><Button disabled={busyAction !== null} onClick={() => void trigger(state.temperature.status === "safe" ? "temperature-high" : "temperature-safe", "Simulated temperature changed.")}><Thermometer />{state.temperature.status === "safe" ? "Raise above limit" : "Return to safe"}</Button></div><div><span><Box />Inventory</span><Button disabled={busyAction !== null} onClick={() => void trigger("inventory", "Simulated stock-in movement added.", { sku: "SKU-001", direction: "in", quantity: 1 })}><Box />Add stock movement</Button><Button variant="outline" disabled={busyAction !== null} onClick={() => void trigger("inventory-variance", "Simulated inventory variance added.")}><AlertTriangle />Add count variance</Button></div><div><span><Play />Guided presentation</span><Button disabled={busyAction !== null} onClick={() => void guidedScenario()}><Play />Create enterprise exception set</Button><Button variant="outline" asChild><Link href="/platform">Open reset controls</Link></Button></div></div><p className="action-message" aria-live="polite">{busyAction ? "Sending action…" : actionMessage}</p></SheetContent></Sheet></>} />
 
@@ -238,10 +344,11 @@ export function LiveWorkspace() {
 
     <section className="operations-grid" aria-label="Live camera and operational status">
       <article className="camera-workspace panel">
-        <div className="camera-command-bar"><div className="camera-command-source"><span className="camera-icon"><Camera /></span><div className="camera-command-identity"><strong>{state.health.cameraLabel}</strong><span>Camera 01 · {state.health.sourceType.toUpperCase()}</span></div><CameraSourceControl activeId={state.health.cameraId} currentLabel={state.health.cameraLabel} disabled={!connected || state.health.cameraSwitchState === "switching"} onSwitched={cameraSwitched} /></div><div className="camera-command-metrics"><span><small>Processing</small><strong className="mono">{state.health.processedFps.toFixed(1)} fps</strong></span><span><small>Resolution</small><strong className="mono">1280×720</strong></span><StatusBadge tone={state.health.cameraSwitchState === "switching" ? "warning" : state.health.camera === "online" ? "safe" : "critical"} label={state.health.cameraSwitchState === "switching" ? "switching" : state.health.camera} /></div></div>
+        <div className="camera-command-bar"><div className="camera-command-source"><span className="camera-icon"><Camera /></span><div className="camera-command-identity"><strong>{state.health.cameraLabel}</strong><span>Camera 01 · {state.health.sourceType.toUpperCase()}</span></div><CameraSourceControl activeId={state.health.cameraId} currentLabel={state.health.cameraLabel} cameraOnline={state.health.camera === "online"} disabled={!connected || state.health.cameraSwitchState === "switching"} onSwitched={cameraSwitched} /></div><div className="camera-command-metrics"><span><small>Processing</small><strong className="mono">{state.health.processedFps.toFixed(1)} fps</strong></span><span><small>Resolution</small><strong className="mono">1280×720</strong></span><StatusBadge tone={state.health.cameraSwitchState === "switching" ? "warning" : state.health.camera === "online" ? "safe" : "critical"} label={state.health.cameraSwitchState === "switching" ? "switching" : state.health.camera} /></div></div>
         <AutomaticMonitoringBar health={state.health} detection={detection} connected={connected} previewFailed={previewFailed} />
         <div className="camera-frame">{cloudVideoConfigured ? <LiveKitCamera /> : connected && !previewFailed ? <img key={`${state.health.cameraId}-${streamRevision}`} src="/api/edge/api/preview.mjpeg" alt={`Live annotated view from ${state.health.cameraLabel}`} onError={() => setPreviewFailed(true)} /> : <div className="camera-empty"><Camera /><strong>{previewFailed ? "Camera preview interrupted" : "Waiting for Camera 01"}</strong><span>{error ?? "Start the edge service and allow macOS camera access."}</span>{previewFailed && <Button variant="secondary" onClick={() => setPreviewFailed(false)}>Reconnect preview</Button>}</div>}<div className="camera-overlay top-left"><span className="record-dot" /> LIVE · NO CAMERA AUDIO</div><div className="camera-overlay bottom-left">Movement trail · zones · person · PPE</div></div>
-        <DetectionRail detection={detection} cleared={detection.status === "attention" && dismissedDetectionKey === detectionKey} busy={resettingDetection} message={detectionMessage} onClear={clearDetectionWarnings} onReset={() => void restartDetection()} />
+        <DetectionRail detection={detection} cleared={detection.status === "attention" && dismissedDetectionKey === detectionKey} busy={resettingDetection || clearingIdentity} hasIdentity={Boolean(employee?.employeeId)} message={detectionMessage} onClear={clearDetectionWarnings} onClearIdentity={() => void clearRememberedIdentity()} onReset={() => void restartDetection()} />
+        <AIPpeAssurancePanel assurance={state.aiPpeAssurance} connected={connected} />
         <footer className="camera-foot"><span><Radio />Last frame {formatRelative(state.health.lastFrameAt, referenceTime)}</span><span className={`verifier-health is-${state.health.ppeVerifier?.status ?? "checking"}`}><ShieldCheck />PPE verifier <strong>{state.health.ppeVerifier?.status === "passed" ? "self-test passed" : state.health.ppeVerifier?.status === "failed" ? "disabled" : "starting"}</strong></span><span>Model <strong>{state.health.modelLabel.split("·")[0]}</strong></span></footer>
       </article>
 
@@ -250,7 +357,7 @@ export function LiveWorkspace() {
 
         <div className="metric-split"><article className={`metric-panel temperature-panel tone-${state.temperature.status}`}><div className="section-label"><Thermometer /><span>Temperature</span></div><div className="primary-reading">{state.temperature.valueC.toFixed(1)}<small>°C</small></div><span className="subtle">Safe range {state.temperature.minC}–{state.temperature.maxC}°C</span><StatusBadge tone={state.temperature.sourceMode === "simulated" ? "simulated" : "safe"} label={state.temperature.sourceMode === "simulated" ? "Simulated sensor" : "Live sensor"} /></article><article className="metric-panel inventory-panel"><div className="section-label"><Box /><span>Inventory</span></div><div className="primary-reading">{inventoryTotal}<small>items</small></div><span className="subtle">Across {state.inventory.length} tagged SKUs</span><span className="tiny-state"><PackageCheck />Stable tagged-crossing rule active</span></article></div>
 
-        <article className="metric-panel employee-panel"><div className="section-label"><UserRound /><span>Staff & PPE</span>{employee && <StatusBadge tone={employee.employeeId ? "safe" : "info"} label={identityBadgeLabel(employee)} />}</div>{employee ? <><div className="employee-identity"><Avatar className="employee-avatar">{employee.photoUrl ? <AvatarImage src={employee.photoUrl} alt="" /> : null}<AvatarFallback>{employee.employeeId ? employee.displayName.slice(0, 2).toUpperCase() : "US"}</AvatarFallback></Avatar><div><strong>{employee.displayName}</strong><span>{employee.employeeId ?? `Track ${employee.trackId ?? "—"}`} · {employee.zone}</span></div>{employee.employeeId ? <BadgeCheck className="safe-icon" aria-label={employee.identityAssociation === "track_session" ? "Identity retained on active track" : "Badge identity verified"} /> : <UserRound className="info-icon" aria-label="Identity not required" />}</div><p className="identity-method">{employee.employeeId ? <BadgeCheck /> : <ShieldCheck />}{identityAssociationText(employee, referenceTime)}</p><PpeGrid ppe={employee.ppe} /><div className="metric-foot"><span>{employee.activity}</span><span>Signal confidence {employee.ppe.confidence ? `${Math.round(employee.ppe.confidence * 100)}%` : "checking"}</span></div></> : <div className="empty-compact"><UserRound /><strong>No staff member in view</strong><span>Automatic PPE monitoring is active and waiting for a person. An employee badge is optional.</span></div>}</article>
+        <article className="metric-panel employee-panel"><div className="section-label"><UserRound /><span>Staff & PPE</span>{employee && <StatusBadge tone={employee.identityAssociation === "session_reentry" ? "info" : employee.employeeId ? "safe" : "info"} label={identityBadgeLabel(employee)} />}</div>{employee ? <><div className="employee-identity"><Avatar className="employee-avatar">{employee.photoUrl ? <AvatarImage src={employee.photoUrl} alt="" /> : null}<AvatarFallback>{employee.employeeId ? employee.displayName.slice(0, 2).toUpperCase() : "US"}</AvatarFallback></Avatar><div><strong>{employee.displayName}</strong><span>{employee.employeeId ?? `Track ${employee.trackId ?? "—"}`} · {employee.zone}</span></div>{employee.employeeId ? <BadgeCheck className="safe-icon" aria-label={employee.identityAssociation === "session_reentry" ? "Identity conservatively reassociated from remembered session" : employee.identityAssociation === "track_session" ? "Identity retained on active track" : "Badge identity verified"} /> : <UserRound className="info-icon" aria-label="Identity not required" />}</div><p className="identity-method">{employee.employeeId ? <BadgeCheck /> : <ShieldCheck />}{identityAssociationText(employee, referenceTime)}</p><PpeGrid ppe={employee.ppe} /><div className="metric-foot"><span>{employee.activity}</span><span>Signal confidence {employee.ppe.confidence ? `${Math.round(employee.ppe.confidence * 100)}%` : "checking"}</span></div></> : <div className="empty-compact"><UserRound /><strong>No staff member in view</strong><span>Automatic PPE monitoring is active and waiting for a person. An employee badge is optional.</span></div>}</article>
       </aside>
     </section>
 

@@ -545,6 +545,125 @@ def test_badge_identity_survives_brief_track_loss_but_expires_after_grace(tmp_pa
     assert 17 not in pipeline.track_employee_binding
 
 
+def test_identity_reentry_restores_one_unambiguous_session_for_ten_minutes(tmp_path) -> None:
+    pipeline = EdgePipeline(
+        Settings(
+            camera_enabled=False,
+            data_dir=tmp_path,
+            identity_binding_seconds=5,
+            identity_reentry_seconds=600,
+            identity_reentry_stability_seconds=1,
+        )
+    )
+    detector = _SwitchablePersonDetector()
+    pipeline.detector = detector
+    pipeline.marker_reader = _OneBadgeThenNone()
+
+    pipeline._process(_frame())
+    verified_at = pipeline.state()["activeEmployee"]["identityVerifiedAt"]
+    detector.visible = False
+    pipeline._process(_frame())
+    pipeline.track_last_seen[17] = time.monotonic() - 6
+    pipeline.identity_sessions["EMP-001"]["lastSeenMonotonic"] = time.monotonic() - 599
+    detector.person.track_id = 41
+    detector.visible = True
+
+    pipeline._process(_frame())
+    assert pipeline.state()["activeEmployee"]["displayName"] == "Unidentified staff member"
+    pipeline.identity_reentry_candidates[41] = ("EMP-001", time.monotonic() - 1.1)
+    pipeline._process(_frame())
+
+    employee = pipeline.state()["activeEmployee"]
+    assert employee["displayName"] == "Ahmed Hassan"
+    assert employee["identityAssociation"] == "session_reentry"
+    assert employee["identityVerifiedAt"] == verified_at
+    assert employee["identityPreviousTrackId"] == 17
+    assert employee["identitySessionWindowSeconds"] == 600
+    assert pipeline.track_employee_binding[41]["employeeId"] == "EMP-001"
+    assert 17 not in pipeline.track_employee_binding
+    reassociation = next(
+        event
+        for event in pipeline.store.list_events()
+        if event["type"] == "identity_session_reassociated"
+    )
+    assert reassociation["trackId"] == 41
+    assert reassociation["confidence"] is None
+    assert reassociation["metadata"]["previous_track_id"] == 17
+    assert reassociation["metadata"]["new_track_id"] == 41
+    assert reassociation["metadata"]["reentry_window_seconds"] == 600
+    assert reassociation["metadata"]["biometric_matching"] is False
+
+
+def test_identity_reentry_expires_after_ten_minutes(tmp_path) -> None:
+    pipeline = EdgePipeline(
+        Settings(
+            camera_enabled=False,
+            data_dir=tmp_path,
+            identity_binding_seconds=5,
+            identity_reentry_seconds=600,
+            identity_reentry_stability_seconds=0,
+        )
+    )
+    detector = _SwitchablePersonDetector()
+    pipeline.detector = detector
+    pipeline.marker_reader = _OneBadgeThenNone()
+
+    pipeline._process(_frame())
+    detector.visible = False
+    pipeline._process(_frame())
+    pipeline.track_last_seen[17] = time.monotonic() - 6
+    pipeline.identity_sessions["EMP-001"]["lastSeenMonotonic"] = time.monotonic() - 601
+    detector.person.track_id = 42
+    detector.visible = True
+    pipeline._process(_frame())
+
+    assert pipeline.state()["activeEmployee"]["displayName"] == "Unidentified staff member"
+    assert pipeline.state()["identitySessions"] == []
+    assert 42 not in pipeline.track_employee_binding
+
+
+def test_identity_reentry_refuses_multiple_people_sessions_and_visible_badges(tmp_path) -> None:
+    pipeline = EdgePipeline(
+        Settings(camera_enabled=False, data_dir=tmp_path, identity_reentry_stability_seconds=0)
+    )
+    now = time.monotonic()
+    marker = Marker(101, np.empty((4, 2)), (100, 190), 0.98)
+    pipeline._bind_track_identity(17, EMPLOYEE_MARKERS[101], marker, now)
+    pipeline._clear_track_identity(17)
+    first = _person()
+    first.track_id = 51
+    second = _person()
+    second.track_id = 52
+
+    assert pipeline._reentry_assignments([first, second], [], {}, now + 1) == {}
+
+    second_session = dict(pipeline.identity_sessions["EMP-001"])
+    second_session["employee"] = EMPLOYEE_MARKERS[102]
+    pipeline.identity_sessions["EMP-002"] = second_session
+    assert pipeline._reentry_assignments([first], [], {}, now + 2) == {}
+
+    pipeline.identity_sessions.pop("EMP-002")
+    assert pipeline._reentry_assignments([first], [marker], {}, now + 3) == {}
+
+
+def test_clear_identity_sessions_preserves_evidence_and_live_ppe_state(tmp_path) -> None:
+    pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
+    pipeline.detector = _OnePersonDetector()
+    pipeline.marker_reader = _OneBadgeThenNone()
+    pipeline._process(_frame())
+    pipeline.ppe_missing_since[("EMP-001", "mask")] = 10.0
+    event_count = len(pipeline.store.list_events())
+
+    result = pipeline.clear_identity_sessions()
+
+    assert result == {"clearedSessions": 1, "retainedEventsDeleted": 0}
+    assert pipeline.identity_sessions == {}
+    assert pipeline.track_employee_binding == {}
+    assert pipeline.track_identity_association == {}
+    assert pipeline.ppe_missing_since[("track:17", "mask")] == 10.0
+    assert len(pipeline.store.list_events()) == event_count
+
+
 def test_detection_reset_clears_track_identity_session(tmp_path) -> None:
     pipeline = EdgePipeline(Settings(camera_enabled=False, data_dir=tmp_path))
     pipeline.detector = _OnePersonDetector()
@@ -559,6 +678,8 @@ def test_detection_reset_clears_track_identity_session(tmp_path) -> None:
     assert pipeline.track_employee_binding_seen == {}
     assert pipeline.track_employee_binding_verified_at == {}
     assert pipeline.track_employee_binding_confidence == {}
+    assert pipeline.track_identity_association == {}
+    assert pipeline.identity_sessions == {}
 
 
 def test_one_badge_cannot_identify_two_overlapping_person_tracks(tmp_path) -> None:
